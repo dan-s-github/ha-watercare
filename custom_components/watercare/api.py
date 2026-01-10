@@ -109,7 +109,7 @@ class WatercareApi:
             async with session.get(
                 url, headers=headers, params=params, allow_redirects=False
             ) as response:
-                if response.status != 200:
+                if response.status not in [200, 301, 302, 307, 308]:
                     response_text = await response.text()
                     _LOGGER.error(
                         "Failed to confirm sign in. Status: %s, Response: %s",
