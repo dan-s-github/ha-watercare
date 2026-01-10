@@ -109,13 +109,30 @@ class WatercareApi:
             async with session.get(
                 url, headers=headers, params=params, allow_redirects=False
             ) as response:
-                response.raise_for_status()
+                if response.status != 200:
+                    response_text = await response.text()
+                    _LOGGER.error(
+                        "Failed to confirm sign in. Status: %s, Response: %s",
+                        response.status,
+                        response_text,
+                    )
+                    raise ValueError(
+                        f"Sign-in confirmation failed with status {response.status}"
+                    )
+
                 location = response.headers.get("Location", "")
+                if not location:
+                    _LOGGER.error("No Location header in response")
+                    raise ValueError("No redirect location in sign-in response")
+
                 query_params = parse_qs(location.split("?", 1)[1])
                 if "error" in query_params:
                     _LOGGER.error("Error in response: %s", query_params["error"][0])
                     _LOGGER.error(
                         "Error description: %s", query_params["error_description"][0]
+                    )
+                    raise ValueError(
+                        f"Authentication error: {query_params['error_description'][0]}"
                     )
 
             code = query_params["code"][0]
