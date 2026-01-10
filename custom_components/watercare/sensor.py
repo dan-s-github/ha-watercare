@@ -9,7 +9,11 @@ from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
+from homeassistant.components.recorder.models import (
+    StatisticData,
+    StatisticMetaData,
+    StatisticMeanType,
+)
 from homeassistant.components.recorder.statistics import async_add_external_statistics
 
 from .const import (
@@ -195,7 +199,9 @@ class WatercareUsageSensor(SensorEntity):
     async def process_data(self, response):
         """Process the API response."""
         if response is None:
-            _LOGGER.error("No response received from Watercare API; skipping processing")
+            _LOGGER.error(
+                "No response received from Watercare API; skipping processing"
+            )
             return
 
         try:
@@ -254,15 +260,6 @@ class WatercareUsageSensor(SensorEntity):
         """Generate external statistics from billing period data following Energy Dashboard pattern."""
         if not billing_periods:
             return
-
-        from homeassistant.components.recorder.models import (
-            StatisticData,
-            StatisticMetaData,
-        )
-        from homeassistant.components.recorder.statistics import (
-            async_add_external_statistics,
-        )
-        import pytz
 
         period_statistics = []
         cost_statistics = []
@@ -335,12 +332,13 @@ class WatercareUsageSensor(SensorEntity):
 
         if period_statistics:
             metadata = StatisticMetaData(
-                has_mean=False,
                 has_sum=True,
                 name="Watercare Water Consumption",
                 source=DOMAIN,
                 statistic_id=f"{DOMAIN}:water_consumption",
                 unit_of_measurement=self._unit_of_measurement,
+                mean_type=StatisticMeanType.NONE,
+                unit_class=None,
             )
 
             _LOGGER.debug(
@@ -352,12 +350,13 @@ class WatercareUsageSensor(SensorEntity):
 
         if cost_statistics:
             cost_metadata = StatisticMetaData(
-                has_mean=False,
                 has_sum=True,
                 name="Watercare Total Cost",
                 source=DOMAIN,
                 statistic_id=f"{DOMAIN}:water_cost",
                 unit_of_measurement="NZD",
+                mean_type=StatisticMeanType.NONE,
+                unit_class=None,
             )
 
             _LOGGER.debug(f"Adding {len(cost_statistics)} water cost statistics")
@@ -368,12 +367,13 @@ class WatercareUsageSensor(SensorEntity):
         # Add consumption cost statistics if configured
         if consumption_cost_statistics and self._consumption_rate > 0:
             consumption_cost_metadata = StatisticMetaData(
-                has_mean=False,
                 has_sum=True,
                 name="Watercare Consumption Cost",
                 source=DOMAIN,
                 statistic_id=f"{DOMAIN}:consumption_cost",
                 unit_of_measurement="NZD",
+                mean_type=StatisticMeanType.NONE,
+                unit_class=None,
             )
 
             _LOGGER.debug(
@@ -386,12 +386,13 @@ class WatercareUsageSensor(SensorEntity):
         # Add wastewater cost statistics if configured
         if wastewater_cost_statistics and self._wastewater_rate > 0:
             wastewater_cost_metadata = StatisticMetaData(
-                has_mean=False,
                 has_sum=True,
                 name="Watercare Wastewater Cost",
                 source=DOMAIN,
                 statistic_id=f"{DOMAIN}:wastewater_cost",
                 unit_of_measurement="NZD",
+                mean_type=StatisticMeanType.NONE,
+                unit_class=None,
             )
 
             _LOGGER.debug(
@@ -505,12 +506,13 @@ class WatercareUsageSensor(SensorEntity):
         # Add daily consumption statistics
         if day_statistics:
             day_metadata = StatisticMetaData(
-                has_mean=False,
                 has_sum=True,
                 name=self._get_statistic_name("consumption"),
                 source=DOMAIN,
                 statistic_id=f"{DOMAIN}:daily_consumption",
                 unit_of_measurement=self._unit_of_measurement,
+                mean_type=StatisticMeanType.NONE,
+                unit_class=None,
             )
 
             _LOGGER.debug(f"Adding {len(day_statistics)} daily consumption statistics")
@@ -521,12 +523,13 @@ class WatercareUsageSensor(SensorEntity):
         # Add daily cost statistics
         if cost_statistics:
             cost_metadata = StatisticMetaData(
-                has_mean=False,
                 has_sum=True,
                 name="Watercare Daily Cost",
                 source=DOMAIN,
                 statistic_id=f"{DOMAIN}:daily_cost",
                 unit_of_measurement="NZD",
+                mean_type=StatisticMeanType.NONE,
+                unit_class=None,
             )
 
             _LOGGER.debug(f"Adding {len(cost_statistics)} daily cost statistics")
@@ -535,12 +538,13 @@ class WatercareUsageSensor(SensorEntity):
         # Add daily consumption cost statistics if configured
         if consumption_cost_statistics and self._consumption_rate > 0:
             consumption_cost_metadata = StatisticMetaData(
-                has_mean=False,
                 has_sum=True,
                 name="Watercare Daily Consumption Cost",
                 source=DOMAIN,
                 statistic_id=f"{DOMAIN}:daily_consumption_cost",
                 unit_of_measurement="NZD",
+                mean_type=StatisticMeanType.NONE,
+                unit_class=None,
             )
 
             _LOGGER.debug(
@@ -553,12 +557,13 @@ class WatercareUsageSensor(SensorEntity):
         # Add daily wastewater cost statistics if configured
         if wastewater_cost_statistics and self._wastewater_rate > 0:
             wastewater_cost_metadata = StatisticMetaData(
-                has_mean=False,
                 has_sum=True,
                 name="Watercare Daily Wastewater Cost",
                 source=DOMAIN,
                 statistic_id=f"{DOMAIN}:daily_wastewater_cost",
                 unit_of_measurement="NZD",
+                mean_type=StatisticMeanType.NONE,
+                unit_class=None,
             )
 
             _LOGGER.debug(
