@@ -676,7 +676,27 @@ class WatercareUsageSensor(SensorEntity):
         await self.generate_halfhourly_statistics(parsed_readings)
 
     async def generate_halfhourly_statistics(self, parsed_readings):
-        """Incrementally extend half-hourly statistics from the last recorded point."""
+        """Incrementally extend hourly statistics from half-hourly readings.
+
+        Home Assistant's long-term statistics table only accepts timestamps on
+        the hour, so pairs of half-hour readings are combined into one hourly
+        point each. The most recent hour is dropped unless both its half-hour
+        readings are present, since it may still be awaiting its second
+        reading -- recording it early would under-count that hour permanently
+        (it would never be revisited once older than the last recorded start).
+        """
+        hourly_totals = {}
+        for start, litres in parsed_readings:
+            hour_start = start.replace(minute=0, second=0, microsecond=0)
+            hourly_totals.setdefault(hour_start, []).append(litres)
+
+        hourly_readings = sorted(hourly_totals.items())
+        if hourly_readings and len(hourly_readings[-1][1]) < 2:
+            hourly_readings = hourly_readings[:-1]
+        hourly_readings = [
+            (start, sum(litres_list)) for start, litres_list in hourly_readings
+        ]
+
         consumption_statistic_id = f"{DOMAIN}:halfhourly_consumption"
         cost_statistic_id = f"{DOMAIN}:halfhourly_cost"
         consumption_cost_statistic_id = f"{DOMAIN}:halfhourly_consumption_cost"
@@ -695,17 +715,17 @@ class WatercareUsageSensor(SensorEntity):
 
         new_readings = [
             (start, litres)
-            for start, litres in parsed_readings
+            for start, litres in hourly_readings
             if last_consumption_start is None or start > last_consumption_start
         ]
 
         if not new_readings:
-            _LOGGER.debug("No new half-hourly readings since last update")
+            _LOGGER.debug("No new complete hourly readings since last update")
             return
 
-        # Each reading is a 30-minute slice of a day, so prorate the annual line
-        # charge accordingly instead of charging a full day per reading.
-        entries = [(start, litres, 1 / 48) for start, litres in new_readings]
+        # Each entry now represents a full hour's worth of usage, so prorate
+        # the annual line charge per hour rather than per half-hour slice.
+        entries = [(start, litres, 1 / 24) for start, litres in new_readings]
 
         self._persist_running_statistics(
             "halfhourly",
