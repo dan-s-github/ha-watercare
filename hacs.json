@@ -4,7 +4,7 @@
 		"NZ"
 	],
 	"filename": "watercare.zip",
-	"hide_default_branch": true,
+	"hide_default_branch": false,
 	"render_readme": true,
 	"zip_release": true
 }
