@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -42,6 +43,12 @@ class WatercareApi:
         self._refresh_token = None
         self._refresh_token_expires_in = 0
         self._access_token_expires_in = 0
+
+        # Auth state (self._token, self._accountNumber, etc.) is mutable and
+        # shared -- the regular poll and an on-demand backfill can both call
+        # get_data() around the same time, so serialize access to avoid two
+        # concurrent OAuth flows stomping on each other.
+        self._lock = asyncio.Lock()
 
     def get_setting_json(self, page: str) -> Mapping[str, Any] | None:
         """Get the settings from json result."""
@@ -232,31 +239,44 @@ class WatercareApi:
             msg = "Invalid endpoint specified"
             raise ValueError(msg)
 
-        # If no account number, need to authenticate first
-        if not self._accountNumber:
-            _LOGGER.debug("No account number found, starting authentication process")
-            await self.get_refresh_token()
+        # Serialize: the regular poll and an on-demand backfill can both
+        # land here around the same time, and auth state is shared mutable
+        # instance state, not safe for concurrent access.
+        async with self._lock:
+            # If no account number, need to authenticate first
             if not self._accountNumber:
-                _LOGGER.error("Authentication failed - no account number obtained")
+                _LOGGER.debug(
+                    "No account number found, starting authentication process"
+                )
+                await self.get_refresh_token()
+                if not self._accountNumber:
+                    _LOGGER.error("Authentication failed - no account number obtained")
+                    return None
+
+            headers = {"authorization": "Bearer " + (self._token or "")}
+
+            url = f"{self._url_base}v1/usage/{self._accountNumber}/{endpoint}"
+            if start_date and end_date:
+                url += f"?from={start_date}&to={end_date}"
+
+            _LOGGER.debug("Calling API URL: %s", url)
+
+            jar = aiohttp.CookieJar(quote_cookie=False)
+            async with (
+                aiohttp.ClientSession(cookie_jar=jar) as session,
+                session.get(url, headers=headers) as response,
+            ):
+                if response.status == _HTTP_OK:
+                    data = await response.text()
+                    _LOGGER.debug("API Response status: %s", response.status)
+                    _LOGGER.debug(
+                        "API Response data length: %s", len(data) if data else 0
+                    )
+                    return data
+                error_text = await response.text()
+                _LOGGER.error(
+                    "Could not fetch consumption: %s, Response: %s",
+                    response.status,
+                    error_text,
+                )
                 return None
-
-        headers = {"authorization": "Bearer " + (self._token or "")}
-
-        url = f"{self._url_base}v1/usage/{self._accountNumber}/{endpoint}"
-        if start_date and end_date:
-            url += f"?from={start_date}&to={end_date}"
-
-        _LOGGER.debug("Calling API URL: %s", url)
-
-        jar = aiohttp.CookieJar(quote_cookie=False)
-        async with (
-            aiohttp.ClientSession(cookie_jar=jar) as session,
-            session.get(url, headers=headers) as response,
-        ):
-            if response.status == _HTTP_OK:
-                data = await response.text()
-                _LOGGER.debug("API Response status: %s", response.status)
-                _LOGGER.debug("API Response data length: %s", len(data) if data else 0)
-                return data
-            _LOGGER.error("Could not fetch consumption: %s", response.status)
-            return None

@@ -7,18 +7,24 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import (
     StatisticData,
     StatisticMeanType,
     StatisticMetaData,
 )
-from homeassistant.components.recorder.statistics import async_add_external_statistics
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
+    get_last_statistics,
+)
 from homeassistant.components.sensor import SensorEntity
+from homeassistant.util.unit_conversion import VolumeConverter
 
 from .const import (
     CONF_ANNUAL_LINE_CHARGE,
     CONF_CONSUMPTION_RATE,
     CONF_ENDPOINT,
+    CONF_HISTORY_BACKFILLED,
     CONF_WASTEWATER_RATE,
     CONF_WASTEWATER_RATIO,
     DEFAULT_ANNUAL_LINE_CHARGE,
@@ -43,6 +49,12 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = timedelta(hours=12)
+
+# The halfhourly endpoint silently caps each request at ~161 days regardless
+# of the requested range (it always starts exactly at the requested `from`
+# date) -- validated empirically against the live API on 2026-08-05.
+HALFHOURLY_BACKFILL_MAX_DAYS = 1095  # ~3 years
+HALFHOURLY_BACKFILL_CHUNK_DAYS = 150  # safety margin under the ~161-day cap
 
 
 async def async_setup_entry(
@@ -76,20 +88,30 @@ async def async_setup_entry(
         )
         endpoint = entry.options.get(CONF_ENDPOINT, endpoint)
 
-    async_add_entities(
-        [
-            WatercareUsageSensor(
-                SENSOR_NAME,
-                api,
-                consumption_rate,
-                wastewater_rate,
-                wastewater_ratio,
-                annual_line_charge,
-                endpoint,
-            )
-        ],
-        update_before_add=True,
+    sensor = WatercareUsageSensor(
+        SENSOR_NAME,
+        api,
+        consumption_rate,
+        wastewater_rate,
+        wastewater_ratio,
+        annual_line_charge,
+        endpoint,
     )
+    hass.data[DOMAIN]["sensor"] = sensor
+
+    async_add_entities([sensor], update_before_add=True)
+
+    if endpoint == "halfhourly" and not entry.data.get(CONF_HISTORY_BACKFILLED):
+
+        async def _run_backfill() -> None:
+            await sensor.async_backfill_halfhourly_history()
+            hass.config_entries.async_update_entry(
+                entry, data={**entry.data, CONF_HISTORY_BACKFILLED: True}
+            )
+
+        entry.async_create_background_task(
+            hass, _run_backfill(), "watercare_history_backfill"
+        )
 
     return True
 
@@ -164,7 +186,7 @@ class WatercareUsageSensor(SensorEntity):
         return self._unique_id
 
     def _calculate_cost(
-        self, usage_litres: float, number_of_days: int
+        self, usage_litres: float, number_of_days: float
     ) -> dict[str, float]:
         """Calculate the total cost based on usage and configured rates."""
         usage_thousands = usage_litres / 1000.0
@@ -195,14 +217,30 @@ class WatercareUsageSensor(SensorEntity):
     async def async_update(self) -> None:
         """Update the sensor data."""
         _LOGGER.debug("Beginning sensor update using endpoint: %s", self._endpoint)
-        response = await self._api.get_data(endpoint=self._endpoint)
+
+        start_date = None
+        end_date = None
+        if self._endpoint == "halfhourly":
+            # Unlike the other endpoints, halfhourly has no server-side
+            # default range and 400s (INVALID_REQUEST_BODY) without one.
+            today = datetime.now(NZ_TIMEZONE).date()
+            start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+            end_date = today.strftime("%Y-%m-%d")
+
+        response = await self._api.get_data(
+            endpoint=self._endpoint, start_date=start_date, end_date=end_date
+        )
 
         # Route to appropriate processing method based on endpoint
         if self._endpoint == "dailywithstats":
             await self.process_daily_data(response)
+        elif self._endpoint == "halfhourly":
+            # halfhourly returns a bare list of {timestamp, litres} readings,
+            # not billing periods or a dailywithstats-style wrapper.
+            await self.process_halfhourly_data(response)
         else:
-            # For mechanicalmonthly, monthly, and halfhourly, use the
-            # billing period processing.
+            # For mechanicalmonthly and monthly, use the billing period
+            # processing.
             await self.process_data(response)
 
     async def process_data(self, response: str | None) -> None:
@@ -215,7 +253,7 @@ class WatercareUsageSensor(SensorEntity):
 
         try:
             billing_periods = json.loads(response)
-        except json.JSONDecodeError:
+        except (TypeError, json.JSONDecodeError):
             _LOGGER.exception("Failed to parse Watercare API response")
             return
 
@@ -361,7 +399,7 @@ class WatercareUsageSensor(SensorEntity):
                 statistic_id=f"{DOMAIN}:water_consumption",
                 unit_of_measurement=self._unit_of_measurement,
                 mean_type=StatisticMeanType.NONE,
-                unit_class=None,
+                unit_class=VolumeConverter.UNIT_CLASS,
             )
 
             _LOGGER.debug(
@@ -426,6 +464,256 @@ class WatercareUsageSensor(SensorEntity):
             async_add_external_statistics(
                 self.hass, wastewater_cost_metadata, wastewater_cost_statistics
             )
+
+    def _bucket_hourly_readings(
+        self, readings: list[dict[str, Any]]
+    ) -> dict[datetime, float]:
+        """Bucket a list of {timestamp, litres} readings into hourly sums."""
+        hourly_consumption: dict[datetime, float] = {}
+        for reading in readings:
+            timestamp_str = reading.get("timestamp")
+            if not timestamp_str:
+                continue
+            try:
+                reading_time = datetime.strptime(
+                    timestamp_str, "%Y-%m-%dT%H:%M:%S.%fZ"
+                ).replace(tzinfo=UTC)
+            except ValueError:
+                _LOGGER.warning("Failed to parse timestamp %s", timestamp_str)
+                continue
+            reading_time = reading_time.astimezone(NZ_TIMEZONE)
+            hour_start = reading_time.replace(minute=0, second=0, microsecond=0)
+            litres = reading.get("litres", 0)
+            hourly_consumption[hour_start] = (
+                hourly_consumption.get(hour_start, 0) + litres
+            )
+        return hourly_consumption
+
+    async def _async_last_statistic_sum(
+        self, statistic_id: str
+    ) -> tuple[float, float | None]:
+        """
+        Return (last cumulative sum, last start timestamp) for a statistic.
+
+        Returns (0.0, None) if the statistic doesn't exist yet.
+        """
+        last_stat = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics,
+            self.hass,
+            1,
+            statistic_id,
+            True,  # noqa: FBT003 -- positional per get_last_statistics' signature
+            {"sum"},
+        )
+        records = last_stat.get(statistic_id)
+        if not records:
+            return 0.0, None
+        return float(records[0].get("sum") or 0.0), records[0]["start"]
+
+    async def _async_push_hourly_statistic(  # noqa: PLR0913 -- one series definition per call keeps push callers declarative; bundling into a dataclass would ripple with no behavior change
+        self,
+        hourly_consumption: dict[datetime, float],
+        *,
+        statistic_id: str,
+        name: str,
+        unit: str,
+        cost_key: str | None,
+        rate_gate: float | None,
+        unit_class: str | None = None,
+    ) -> None:
+        """
+        Push one incremental hourly external-statistics series.
+
+        Continues from whatever cumulative sum is already stored for
+        `statistic_id` rather than resetting to zero, and only appends
+        hours after the last stored one -- so repeated polls and a one-off
+        deep backfill can safely share the same statistic history without
+        the running total jumping backwards.
+        """
+        if rate_gate is not None and rate_gate <= 0:
+            return
+
+        running_sum, last_start = await self._async_last_statistic_sum(statistic_id)
+
+        new_points = []
+        for hour_start in sorted(hourly_consumption):
+            if last_start is not None and hour_start.timestamp() <= last_start:
+                continue
+            litres = hourly_consumption[hour_start]
+            if cost_key is None:
+                running_sum += litres
+            else:
+                running_sum += self._calculate_cost(litres, 1 / 24)[cost_key]
+            new_points.append(StatisticData(start=hour_start, sum=running_sum))
+
+        metadata = StatisticMetaData(
+            has_sum=True,
+            name=name,
+            source=DOMAIN,
+            statistic_id=statistic_id,
+            unit_of_measurement=unit,
+            mean_type=StatisticMeanType.NONE,
+            unit_class=unit_class,
+        )
+        _LOGGER.debug("Adding %s statistics for %s", len(new_points), statistic_id)
+        async_add_external_statistics(self.hass, metadata, new_points)
+
+    async def _async_push_halfhourly_statistics(
+        self, hourly_consumption: dict[datetime, float]
+    ) -> None:
+        """Push all four hourly statistic series for the halfhourly endpoint."""
+        await self._async_push_hourly_statistic(
+            hourly_consumption,
+            statistic_id=f"{DOMAIN}:halfhourly_consumption",
+            name=self._get_statistic_name("consumption"),
+            unit=self._unit_of_measurement,
+            cost_key=None,
+            rate_gate=None,
+            unit_class=VolumeConverter.UNIT_CLASS,
+        )
+        await self._async_push_hourly_statistic(
+            hourly_consumption,
+            statistic_id=f"{DOMAIN}:halfhourly_cost",
+            name="Watercare Half-hourly Cost",
+            unit="NZD",
+            cost_key="total",
+            rate_gate=None,
+        )
+        await self._async_push_hourly_statistic(
+            hourly_consumption,
+            statistic_id=f"{DOMAIN}:halfhourly_consumption_cost",
+            name="Watercare Half-hourly Consumption Cost",
+            unit="NZD",
+            cost_key="consumption",
+            rate_gate=self._consumption_rate,
+        )
+        await self._async_push_hourly_statistic(
+            hourly_consumption,
+            statistic_id=f"{DOMAIN}:halfhourly_wastewater_cost",
+            name="Watercare Half-hourly Wastewater Cost",
+            unit="NZD",
+            cost_key="wastewater",
+            rate_gate=self._wastewater_rate,
+        )
+
+    async def process_halfhourly_data(self, response: str | None) -> None:
+        """
+        Process the halfhourly API response.
+
+        Unlike the other endpoints, halfhourly returns a bare list of
+        {timestamp, litres} readings with no billing/account metadata.
+        """
+        if response is None:
+            _LOGGER.error(
+                "No response received from Watercare API; skipping processing"
+            )
+            return
+
+        try:
+            readings = json.loads(response)
+        except (TypeError, json.JSONDecodeError):
+            _LOGGER.exception("Failed to parse Watercare API response")
+            return
+
+        _LOGGER.debug("Processing halfhourly data: %s readings", len(readings or []))
+
+        if not readings:
+            _LOGGER.warning("No halfhourly readings found")
+            return
+
+        hourly_consumption = self._bucket_hourly_readings(readings)
+        if not hourly_consumption:
+            _LOGGER.warning("No valid halfhourly readings found")
+            return
+
+        # Today's consumption so far, for the sensor's own state/attributes.
+        today = datetime.now(NZ_TIMEZONE).date()
+        today_consumption = sum(
+            litres
+            for hour, litres in hourly_consumption.items()
+            if hour.date() == today
+        )
+        self._state = today_consumption
+
+        cost_breakdown = self._calculate_cost(today_consumption, 1)
+        self._state_attributes = {
+            "today_consumption": today_consumption,
+            "current_period_cost": round(cost_breakdown["total"], 2),
+            "current_period_cost_consumption": round(cost_breakdown["consumption"], 2),
+            "current_period_cost_wastewater": round(cost_breakdown["wastewater"], 2),
+            "consumption_rate_per_1000L": self._consumption_rate,
+            "wastewater_rate_per_1000L": self._wastewater_rate,
+            "endpoint": self._endpoint,
+            "cost_currency": "NZD",
+        }
+
+        await self._async_push_halfhourly_statistics(hourly_consumption)
+
+    async def async_backfill_halfhourly_history(self) -> None:
+        """
+        One-time deep import of halfhourly history beyond the normal rolling window.
+
+        The API silently caps each request at ~161 days regardless of the
+        requested range (it always starts exactly at the requested `from`
+        date), so this pages backward in fixed-size chunks.
+        """
+        _LOGGER.info("Starting Watercare halfhourly history backfill")
+        today = datetime.now(NZ_TIMEZONE).date()
+        chunk_end = today
+        all_readings: dict[str, float] = {}
+
+        while (today - chunk_end).days < HALFHOURLY_BACKFILL_MAX_DAYS:
+            chunk_start = chunk_end - timedelta(days=HALFHOURLY_BACKFILL_CHUNK_DAYS)
+            response = await self._api.get_data(
+                endpoint="halfhourly",
+                start_date=chunk_start.strftime("%Y-%m-%d"),
+                end_date=chunk_end.strftime("%Y-%m-%d"),
+            )
+            if response is None:
+                _LOGGER.warning(
+                    "Backfill stopped: request for %s to %s failed",
+                    chunk_start,
+                    chunk_end,
+                )
+                break
+
+            try:
+                readings = json.loads(response)
+            except (TypeError, json.JSONDecodeError):
+                _LOGGER.exception(
+                    "Backfill: failed to parse response for %s to %s",
+                    chunk_start,
+                    chunk_end,
+                )
+                break
+
+            if not readings:
+                _LOGGER.info(
+                    "Backfill reached the start of available history at %s", chunk_end
+                )
+                break
+
+            for reading in readings:
+                timestamp_str = reading.get("timestamp")
+                if timestamp_str:
+                    all_readings[timestamp_str] = reading.get("litres", 0)
+
+            chunk_end = chunk_start
+
+        if not all_readings:
+            _LOGGER.warning("Backfill found no historical data")
+            return
+
+        hourly_consumption = self._bucket_hourly_readings(
+            [
+                {"timestamp": timestamp, "litres": litres}
+                for timestamp, litres in all_readings.items()
+            ]
+        )
+        await self._async_push_halfhourly_statistics(hourly_consumption)
+        _LOGGER.info(
+            "Backfill complete: imported %s hourly buckets", len(hourly_consumption)
+        )
 
     async def process_daily_data(  # noqa: PLR0915 -- builds four parallel running-sum series in one pass; splitting would obscure the shared iteration
         self, response: str | None
@@ -553,7 +841,7 @@ class WatercareUsageSensor(SensorEntity):
                 statistic_id=f"{DOMAIN}:daily_consumption",
                 unit_of_measurement=self._unit_of_measurement,
                 mean_type=StatisticMeanType.NONE,
-                unit_class=None,
+                unit_class=VolumeConverter.UNIT_CLASS,
             )
 
             _LOGGER.debug("Adding %s daily consumption statistics", len(day_statistics))

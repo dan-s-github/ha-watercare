@@ -5,8 +5,13 @@ set -e
 cd "$(dirname "$0")/.."
 
 # Create config dir if not present
-if [[ ! -d "${PWD}/config" ]]; then
-    mkdir -p "${PWD}/config"
+mkdir -p "${PWD}/config"
+
+# configuration.yaml is checked into git, so config/ already exists on a
+# fresh checkout and `ensure_config` would otherwise be skipped -- but the
+# includes it references (automations.yaml, scripts.yaml, scenes.yaml,
+# themes/) are gitignored and still need generating.
+if [[ ! -f "${PWD}/config/automations.yaml" ]]; then
     hass --config "${PWD}/config" --script ensure_config
 fi
 

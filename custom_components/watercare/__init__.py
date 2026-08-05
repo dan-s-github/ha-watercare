@@ -12,11 +12,13 @@ from .const import DOMAIN
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
-    from homeassistant.core import HomeAssistant
+    from homeassistant.core import HomeAssistant, ServiceCall
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.SENSOR]
+
+SERVICE_BACKFILL_HISTORY = "backfill_history"
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -36,6 +38,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
+    async def _async_handle_backfill_history(call: ServiceCall) -> None:  # noqa: ARG001
+        sensor = hass.data.get(DOMAIN, {}).get("sensor")
+        if sensor is None:
+            _LOGGER.error("Watercare sensor not yet set up; cannot backfill history")
+            return
+        await sensor.async_backfill_halfhourly_history()
+
+    if not hass.services.has_service(DOMAIN, SERVICE_BACKFILL_HISTORY):
+        hass.services.async_register(
+            DOMAIN, SERVICE_BACKFILL_HISTORY, _async_handle_backfill_history
+        )
+
     return True
 
 
@@ -44,5 +58,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         hass.data[DOMAIN].pop("api")
+        hass.data[DOMAIN].pop("sensor", None)
 
     return unload_ok
