@@ -99,15 +99,27 @@ async def async_setup_entry(
     )
     hass.data[DOMAIN]["sensor"] = sensor
 
-    async_add_entities([sensor], update_before_add=True)
+    needs_backfill = endpoint == "halfhourly" and not entry.data.get(
+        CONF_HISTORY_BACKFILLED
+    )
 
-    if endpoint == "halfhourly" and not entry.data.get(CONF_HISTORY_BACKFILLED):
+    # When a backfill is pending, skip the immediate update-before-add: the
+    # backfill must run and land its (older) history first, since
+    # _async_push_hourly_statistic only appends points after the latest
+    # already-stored one -- doing the regular update first would set that
+    # watermark to "now" and cause the backfill's data to be silently
+    # discarded as already-superseded.
+    async_add_entities([sensor], update_before_add=not needs_backfill)
+
+    if needs_backfill:
 
         async def _run_backfill() -> None:
             await sensor.async_backfill_halfhourly_history()
             hass.config_entries.async_update_entry(
                 entry, data={**entry.data, CONF_HISTORY_BACKFILLED: True}
             )
+            await sensor.async_update()
+            sensor.async_write_ha_state()
 
         entry.async_create_background_task(
             hass, _run_backfill(), "watercare_history_backfill"

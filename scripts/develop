@@ -7,13 +7,16 @@ cd "$(dirname "$0")/.."
 # Create config dir if not present
 mkdir -p "${PWD}/config"
 
-# configuration.yaml is checked into git, so config/ already exists on a
-# fresh checkout and `ensure_config` would otherwise be skipped -- but the
-# includes it references (automations.yaml, scripts.yaml, scenes.yaml,
-# themes/) are gitignored and still need generating.
-if [[ ! -f "${PWD}/config/automations.yaml" ]]; then
-    hass --config "${PWD}/config" --script ensure_config
-fi
+# configuration.yaml's !include/!include_dir_merge_named targets
+# (automations.yaml, scripts.yaml, scenes.yaml, themes/) are gitignored and
+# need generating on a fresh checkout. `hass --script ensure_config` can't be
+# used for this: it only calls Home Assistant's default-config writer when
+# configuration.yaml itself is missing, and ours is checked into git, so it
+# would silently no-op.
+mkdir -p "${PWD}/config/themes"
+[[ -f "${PWD}/config/automations.yaml" ]] || printf '[]' > "${PWD}/config/automations.yaml"
+[[ -f "${PWD}/config/scripts.yaml" ]] || touch "${PWD}/config/scripts.yaml"
+[[ -f "${PWD}/config/scenes.yaml" ]] || touch "${PWD}/config/scenes.yaml"
 
 # Set the path to custom_components
 ## This let's us have the structure we want <root>/custom_components/integration_blueprint

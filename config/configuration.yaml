@@ -1,4 +1,3 @@
-
 # Minimal set of integrations for developing/testing the watercare
 # custom component. default_config: was replaced because it also
 # loads usb/bluetooth/go2rtc, which fail to set up in this devcontainer.

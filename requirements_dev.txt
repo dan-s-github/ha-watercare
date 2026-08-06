@@ -18,3 +18,7 @@ infrared-protocols==5.6.1
 aiohasupervisor==0.4.3
 hassil==3.7.0
 home-assistant-intents==2026.6.1
+mutagen==1.47.0
+pymicro-vad==1.0.1
+pyspeex-noise==1.0.2
+openai==2.21.0
