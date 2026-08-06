@@ -97,9 +97,6 @@ class WatercareConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 class WatercareOptionsFlowHandler(config_entries.OptionsFlowWithConfigEntry):
     """Handle options."""
 
-    def __init__(self, config_entry: ConfigEntry) -> None:
-        """Initialize options flow."""
-
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:

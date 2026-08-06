@@ -3,7 +3,7 @@
     "image": "mcr.microsoft.com/devcontainers/base:debian",
     "postCreateCommand": "scripts/setup",
     "mounts": [
-        "source=/Users/daniel/oss/ha_projects/ha-watercare/bare.git,target=/Users/daniel/oss/ha_projects/ha-watercare/bare.git,type=bind"
+        "source=${localWorkspaceFolder}/../bare.git,target=${localWorkspaceFolder}/../bare.git,type=bind"
     ],
     "forwardPorts": [
         8123

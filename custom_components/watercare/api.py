@@ -190,7 +190,7 @@ class WatercareApi:
                 if response.status == _HTTP_OK:
                     json_result = await response.json()
                     self._token = json_result["access_token"]
-                    _LOGGER.debug("Authenticity Token: %s", self._token)
+                    _LOGGER.debug("Access token retrieved successfully.")
                     await self.get_accounts()
                 else:
                     _LOGGER.error("Failed to retrieve the token page.")

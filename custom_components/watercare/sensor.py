@@ -215,7 +215,7 @@ class WatercareUsageSensor(SensorEntity):
 
         try:
             billing_periods = json.loads(response)
-        except TypeError, json.JSONDecodeError:
+        except json.JSONDecodeError:
             _LOGGER.exception("Failed to parse Watercare API response")
             return
 
@@ -431,6 +431,12 @@ class WatercareUsageSensor(SensorEntity):
         self, response: str | None
     ) -> None:
         """Process the daily data."""
+        if response is None:
+            _LOGGER.error(
+                "No response received from Watercare API; skipping processing"
+            )
+            return
+
         try:
             parsed_data = json.loads(response)
         except json.JSONDecodeError:
