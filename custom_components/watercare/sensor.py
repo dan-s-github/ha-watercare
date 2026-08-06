@@ -265,7 +265,10 @@ class WatercareUsageSensor(SensorEntity):
 
         try:
             billing_periods = json.loads(response)
-        except (TypeError, json.JSONDecodeError):
+        except (
+            TypeError,
+            json.JSONDecodeError,
+        ):
             _LOGGER.exception("Failed to parse Watercare API response")
             return
 
@@ -623,7 +626,10 @@ class WatercareUsageSensor(SensorEntity):
 
         try:
             readings = json.loads(response)
-        except (TypeError, json.JSONDecodeError):
+        except (
+            TypeError,
+            json.JSONDecodeError,
+        ):
             _LOGGER.exception("Failed to parse Watercare API response")
             return
 
@@ -691,7 +697,10 @@ class WatercareUsageSensor(SensorEntity):
 
             try:
                 readings = json.loads(response)
-            except (TypeError, json.JSONDecodeError):
+            except (
+                TypeError,
+                json.JSONDecodeError,
+            ):
                 _LOGGER.exception(
                     "Backfill: failed to parse response for %s to %s",
                     chunk_start,
