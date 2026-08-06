@@ -1,7 +1,5 @@
 {
 	"name": "Watercare",
-    "filename": "watercare.zip",
-    "zip_release": true,
     "homeassistant": "2026.6.4",
     "hacs": "2.0.5"
 }
