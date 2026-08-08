@@ -2,10 +2,10 @@
 Shared fixtures for the watercare test suite.
 
 Avoids pulling in a full pytest-homeassistant-custom-component `hass`/recorder
-fixture: sensor.py only touches `hass` by passing it through to a handful of
-recorder functions imported by name (`async_add_external_statistics`,
-`get_last_statistics`, `get_instance`), so those are monkeypatched directly
-with in-memory fakes instead.
+fixture: sensor.py and statistics_helpers.py only touch `hass` by passing it
+through to a handful of recorder functions imported by name
+(`async_add_external_statistics`, `get_last_statistics`, `get_instance`), so
+those are monkeypatched directly with in-memory fakes instead.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from custom_components.watercare import sensor as watercare_sensor
+from custom_components.watercare import statistics_helpers
 from custom_components.watercare.const import NZ_TIMEZONE
 
 if TYPE_CHECKING:
@@ -92,7 +93,7 @@ def patch_recorder(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         watercare_sensor, "get_last_statistics", fake_get_last_statistics
     )
     monkeypatch.setattr(
-        watercare_sensor,
+        statistics_helpers,
         "async_add_external_statistics",
         fake_async_add_external_statistics,
     )
