@@ -781,7 +781,7 @@ class WatercareUsageSensor(SensorEntity):
         cost_key: str | None,
         rate_gate: float | None,
         unit_class: str | None = None,
-    ) -> None:
+    ) -> int:
         """
         Push one incremental hourly external-statistics series.
 
@@ -790,9 +790,14 @@ class WatercareUsageSensor(SensorEntity):
         hours after the last stored one -- so repeated polls and a one-off
         deep backfill can safely share the same statistic history without
         the running total jumping backwards.
+
+        Returns the number of new points actually written -- callers that
+        expect to backfill older history should check this, since it will
+        be 0 if `hourly_consumption` is entirely at or before the existing
+        watermark.
         """
         if rate_gate is not None and rate_gate <= 0:
-            return
+            return 0
 
         running_sum, last_start = await self._async_last_statistic_sum(statistic_id)
 
@@ -808,7 +813,7 @@ class WatercareUsageSensor(SensorEntity):
             new_points.append(StatisticData(start=hour_start, sum=running_sum))
 
         if not new_points:
-            return
+            return 0
 
         metadata = StatisticMetaData(
             has_sum=True,
@@ -821,12 +826,19 @@ class WatercareUsageSensor(SensorEntity):
         )
         _LOGGER.debug("Adding %s statistics for %s", len(new_points), statistic_id)
         async_add_external_statistics(self.hass, metadata, new_points)
+        return len(new_points)
 
     async def _async_push_halfhourly_statistics(
         self, hourly_consumption: dict[datetime, float]
-    ) -> None:
-        """Push all four hourly statistic series for the halfhourly endpoint."""
-        await self._async_push_hourly_statistic(
+    ) -> int:
+        """
+        Push all four hourly statistic series for the halfhourly endpoint.
+
+        Returns the number of new consumption points written (the other
+        three series share the same watermark and will match, unless
+        gated off entirely by a zero rate).
+        """
+        new_count = await self._async_push_hourly_statistic(
             hourly_consumption,
             statistic_id=f"{DOMAIN}:halfhourly_consumption",
             name=self._get_statistic_name("consumption"),
@@ -859,6 +871,7 @@ class WatercareUsageSensor(SensorEntity):
             cost_key="wastewater",
             rate_gate=self._wastewater_rate,
         )
+        return new_count
 
     async def process_halfhourly_data(self, response: str | None) -> None:
         """
@@ -982,10 +995,42 @@ class WatercareUsageSensor(SensorEntity):
                 for timestamp, litres in all_readings.items()
             ]
         )
-        await self._async_push_halfhourly_statistics(hourly_consumption)
-        _LOGGER.info(
-            "Backfill complete: imported %s hourly buckets", len(hourly_consumption)
+
+        # Pushing is append-only (see _async_push_hourly_statistic): it only
+        # writes hours after the statistic's existing watermark. If regular
+        # polling has already run and advanced that watermark, none of this
+        # deep-history data -- which is by definition older -- can actually
+        # be written, even though the API calls above succeeded.
+        _, last_start = await self._async_last_statistic_sum(
+            f"{DOMAIN}:halfhourly_consumption"
         )
+        oldest_collected = min(hourly_consumption)
+        if last_start is not None and oldest_collected.timestamp() <= last_start:
+            _LOGGER.warning(
+                "Backfill collected %s hourly buckets back to %s, but existing "
+                "halfhourly statistics already start at or before that point "
+                "(from regular polling) -- history is only ever appended after "
+                "the latest stored hour, so this older data won't be written. "
+                "To re-import deeper history, clear the watercare:halfhourly_* "
+                "statistics first (Developer tools > Statistics) and re-run "
+                "this service",
+                len(hourly_consumption),
+                oldest_collected,
+            )
+
+        new_count = await self._async_push_halfhourly_statistics(hourly_consumption)
+        if new_count:
+            _LOGGER.info(
+                "Backfill complete: wrote %s new hourly buckets (of %s collected)",
+                new_count,
+                len(hourly_consumption),
+            )
+        else:
+            _LOGGER.warning(
+                "Backfill collected %s hourly buckets but wrote none -- they "
+                "were all at or before the existing statistics watermark",
+                len(hourly_consumption),
+            )
 
     async def process_daily_data(  # noqa: PLR0915 -- builds four parallel running-sum series in one pass; splitting would obscure the shared iteration
         self, response: str | None
