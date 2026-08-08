@@ -63,11 +63,12 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> bool:
     """Set up the Watercare sensor platform."""
-    if "api" not in hass.data[DOMAIN]:
+    entry_data = hass.data[DOMAIN].get(entry.entry_id, {})
+    if "api" not in entry_data:
         _LOGGER.error("API instance not found in config entry data.")
         return False
 
-    api = hass.data[DOMAIN]["api"]
+    api = entry_data["api"]
 
     # Get rates and endpoint from config entry data
     consumption_rate = entry.data.get(CONF_CONSUMPTION_RATE, DEFAULT_CONSUMPTION_RATE)
@@ -97,7 +98,7 @@ async def async_setup_entry(
         annual_line_charge,
         endpoint,
     )
-    hass.data[DOMAIN]["sensor"] = sensor
+    entry_data["sensor"] = sensor
 
     needs_backfill = endpoint == "halfhourly" and not entry.data.get(
         CONF_HISTORY_BACKFILLED
@@ -148,7 +149,14 @@ class WatercareUsageSensor(SensorEntity):
         self._unit_of_measurement = "L"
         self._unique_id = DOMAIN
         self._device_class = "water"
-        self._state_class = "total_increasing"
+        # The halfhourly endpoint's own entity state is "today's consumption
+        # so far", which resets to zero each day -- total_increasing requires
+        # a value that never decreases, so use measurement instead. The other
+        # endpoints' states are billing-period/previous-day totals that don't
+        # reset within a single sensor lifetime the same way.
+        self._state_class = (
+            "measurement" if endpoint == "halfhourly" else "total_increasing"
+        )
         self._state_attributes = {}
         self._api = api
         self._consumption_rate = consumption_rate
@@ -215,7 +223,7 @@ class WatercareUsageSensor(SensorEntity):
             "total": total_cost,
             "consumption": consumption_cost,
             "wastewater": wastewater_cost,
-            "line_charge": DEFAULT_ANNUAL_LINE_CHARGE / 365,
+            "line_charge": line_charge,
         }
 
     def _get_statistic_name(self, statistic_type: str) -> str:
@@ -561,6 +569,9 @@ class WatercareUsageSensor(SensorEntity):
                 running_sum += self._calculate_cost(litres, 1 / 24)[cost_key]
             new_points.append(StatisticData(start=hour_start, sum=running_sum))
 
+        if not new_points:
+            return
+
         metadata = StatisticMetaData(
             has_sum=True,
             name=name,
@@ -689,11 +700,12 @@ class WatercareUsageSensor(SensorEntity):
             )
             if response is None:
                 _LOGGER.warning(
-                    "Backfill stopped: request for %s to %s failed",
+                    "Backfill aborted: request for %s to %s failed; "
+                    "no statistics written so a retry can resume from the start",
                     chunk_start,
                     chunk_end,
                 )
-                break
+                return
 
             try:
                 readings = json.loads(response)
@@ -702,11 +714,12 @@ class WatercareUsageSensor(SensorEntity):
                 json.JSONDecodeError,
             ):
                 _LOGGER.exception(
-                    "Backfill: failed to parse response for %s to %s",
+                    "Backfill aborted: failed to parse response for %s to %s; "
+                    "no statistics written so a retry can resume from the start",
                     chunk_start,
                     chunk_end,
                 )
-                break
+                return
 
             if not readings:
                 _LOGGER.info(

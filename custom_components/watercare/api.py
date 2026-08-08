@@ -239,9 +239,12 @@ class WatercareApi:
             msg = "Invalid endpoint specified"
             raise ValueError(msg)
 
-        # Serialize: the regular poll and an on-demand backfill can both
-        # land here around the same time, and auth state is shared mutable
-        # instance state, not safe for concurrent access.
+        # Serialize only the auth/token mutation: the regular poll and an
+        # on-demand backfill can both land here around the same time, and
+        # auth state is shared mutable instance state, not safe for
+        # concurrent access. The HTTP request itself is read-only against a
+        # snapshot of that state, so it runs outside the lock -- otherwise a
+        # long-running backfill request would stall regular polling.
         async with self._lock:
             # If no account number, need to authenticate first
             if not self._accountNumber:
@@ -253,30 +256,33 @@ class WatercareApi:
                     _LOGGER.error("Authentication failed - no account number obtained")
                     return None
 
-            headers = {"authorization": "Bearer " + (self._token or "")}
+            account_number = self._accountNumber
+            token = self._token
 
-            url = f"{self._url_base}v1/usage/{self._accountNumber}/{endpoint}"
-            if start_date and end_date:
-                url += f"?from={start_date}&to={end_date}"
+        headers = {"authorization": "Bearer " + (token or "")}
 
-            _LOGGER.debug("Calling API URL: %s", url)
+        url = f"{self._url_base}v1/usage/{account_number}/{endpoint}"
+        if start_date and end_date:
+            url += f"?from={start_date}&to={end_date}"
 
-            jar = aiohttp.CookieJar(quote_cookie=False)
-            async with (
-                aiohttp.ClientSession(cookie_jar=jar) as session,
-                session.get(url, headers=headers) as response,
-            ):
-                if response.status == _HTTP_OK:
-                    data = await response.text()
-                    _LOGGER.debug("API Response status: %s", response.status)
-                    _LOGGER.debug(
-                        "API Response data length: %s", len(data) if data else 0
-                    )
-                    return data
-                error_text = await response.text()
-                _LOGGER.error(
-                    "Could not fetch consumption: %s, Response: %s",
-                    response.status,
-                    error_text,
+        _LOGGER.debug("Calling API URL: %s", url)
+
+        jar = aiohttp.CookieJar(quote_cookie=False)
+        async with (
+            aiohttp.ClientSession(cookie_jar=jar) as session,
+            session.get(url, headers=headers) as response,
+        ):
+            if response.status == _HTTP_OK:
+                data = await response.text()
+                _LOGGER.debug("API Response status: %s", response.status)
+                _LOGGER.debug(
+                    "API Response data length: %s", len(data) if data else 0
                 )
-                return None
+                return data
+            error_text = await response.text()
+            _LOGGER.error(
+                "Could not fetch consumption: %s, Response: %s",
+                response.status,
+                error_text,
+            )
+            return None
