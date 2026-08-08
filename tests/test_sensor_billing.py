@@ -74,7 +74,8 @@ async def test_process_data_handles_malformed_json(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
     sensor = make_sensor(endpoint="mechanicalmonthly")
+    sensor._state = 123.45  # seed a sentinel to prove it's left untouched
 
     await sensor.process_data("not json")
 
-    assert sensor.state is None
+    assert sensor.state == 123.45
