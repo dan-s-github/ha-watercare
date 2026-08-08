@@ -525,7 +525,10 @@ class WatercareUsageSensor(SensorEntity):
             ts = datetime.strptime(timestamp_str, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
                 tzinfo=UTC
             )
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             return 30
         days_in_month = calendar.monthrange(ts.year, ts.month)[1]
         missing_days = reading.get("numberOfMissingDays", 0) or 0
@@ -562,9 +565,7 @@ class WatercareUsageSensor(SensorEntity):
             _LOGGER.warning("No monthly readings found")
             return
 
-        sorted_readings = sorted(
-            monthly_readings, key=lambda x: x.get("timestamp", "")
-        )
+        sorted_readings = sorted(monthly_readings, key=lambda x: x.get("timestamp", ""))
 
         latest = sorted_readings[-1]
         latest_usage = latest.get("litres", 0)

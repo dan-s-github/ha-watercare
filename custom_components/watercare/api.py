@@ -275,9 +275,7 @@ class WatercareApi:
             if response.status == _HTTP_OK:
                 data = await response.text()
                 _LOGGER.debug("API Response status: %s", response.status)
-                _LOGGER.debug(
-                    "API Response data length: %s", len(data) if data else 0
-                )
+                _LOGGER.debug("API Response data length: %s", len(data) if data else 0)
                 return data
             error_text = await response.text()
             _LOGGER.error(
