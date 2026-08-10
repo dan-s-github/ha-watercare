@@ -118,6 +118,76 @@ async def test_get_data_triggers_refresh_token_when_unauthenticated() -> None:
     assert result == "authed"
 
 
+async def test_get_data_reauthenticates_and_retries_on_401() -> None:
+    api = _make_api()
+    api._accountNumber = "123"
+    api._token = "stale-token"
+    api._refresh_token = "some-refresh-token"
+
+    async def _fake_get_api_token(*_args: Any, **_kwargs: Any) -> bool:
+        api._token = "fresh-token"
+        return True
+
+    api.get_api_token = AsyncMock(side_effect=_fake_get_api_token)
+
+    with aioresponses() as mocked:
+        mocked.get(f"{BASE_URL}v1/usage/123/halfhourly", status=401, body="")
+        mocked.get(f"{BASE_URL}v1/usage/123/halfhourly", status=200, body="retried-ok")
+
+        result = await api.get_data(endpoint="halfhourly")
+
+    api.get_api_token.assert_awaited_once()
+    assert result == "retried-ok"
+
+
+async def test_get_data_falls_back_to_full_login_when_refresh_grant_fails() -> None:
+    """Regression: a failed refresh-token grant isn't treated as re-auth success."""
+    api = _make_api()
+    api._accountNumber = "123"
+    api._token = "stale-token"
+    api._refresh_token = "expired-refresh-token"
+
+    async def _fake_get_api_token(*_args: Any, **_kwargs: Any) -> bool:
+        return False  # refresh token itself has expired; _token untouched
+
+    async def _fake_refresh_token(*_args: Any, **_kwargs: Any) -> None:
+        api._accountNumber = "123"
+        api._token = "fresh-token-from-full-login"
+
+    api.get_api_token = AsyncMock(side_effect=_fake_get_api_token)
+    api.get_refresh_token = AsyncMock(side_effect=_fake_refresh_token)
+
+    with aioresponses() as mocked:
+        mocked.get(f"{BASE_URL}v1/usage/123/halfhourly", status=401, body="")
+        mocked.get(f"{BASE_URL}v1/usage/123/halfhourly", status=200, body="retried-ok")
+
+        result = await api.get_data(endpoint="halfhourly")
+
+    api.get_api_token.assert_awaited_once()
+    api.get_refresh_token.assert_awaited_once()
+    assert result == "retried-ok"
+
+
+async def test_get_data_returns_none_when_reauth_after_401_fails() -> None:
+    api = _make_api()
+    api._accountNumber = "123"
+    api._token = "stale-token"
+    api._refresh_token = None
+
+    async def _fake_refresh_token(*_args: Any, **_kwargs: Any) -> None:
+        api._accountNumber = None  # re-authentication fails
+
+    api.get_refresh_token = AsyncMock(side_effect=_fake_refresh_token)
+
+    with aioresponses() as mocked:
+        mocked.get(f"{BASE_URL}v1/usage/123/halfhourly", status=401, body="")
+
+        result = await api.get_data(endpoint="halfhourly")
+
+    api.get_refresh_token.assert_awaited_once()
+    assert result is None
+
+
 async def test_get_data_returns_none_when_authentication_fails() -> None:
     api = _make_api()
 
@@ -125,9 +195,14 @@ async def test_get_data_returns_none_when_authentication_fails() -> None:
         side_effect=lambda: None
     )  # never sets _accountNumber
 
-    result = await api.get_data(endpoint="halfhourly")
+    # No routes registered: if get_data() proceeded to make a usage request
+    # despite failed auth, aioresponses would raise instead of letting a real
+    # network call slip through.
+    with aioresponses() as mocked:
+        result = await api.get_data(endpoint="halfhourly")
 
     assert result is None
+    mocked.assert_not_called()
 
 
 class _FakeResponse:
