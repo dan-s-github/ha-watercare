@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 _HTTP_OK = 200
+_HTTP_UNAUTHORIZED = 401
 
 
 class WatercareApi:
@@ -239,14 +240,45 @@ class WatercareApi:
             msg = "Invalid endpoint specified"
             raise ValueError(msg)
 
+        await self._ensure_authenticated()
+
+        status, data, error_text = await self._request_usage(
+            endpoint, start_date, end_date
+        )
+        if status == _HTTP_UNAUTHORIZED:
+            # Access token expired/rejected -- get_data() previously only
+            # re-authenticated when we had no account number at all, so once
+            # logged in once, a stale token would be reused forever and every
+            # later poll would 401. Re-authenticate once and retry.
+            _LOGGER.debug("Access token rejected (401); re-authenticating and retrying")
+            async with self._lock:
+                if self._refresh_token:
+                    await self.get_api_token()
+                else:
+                    await self.get_refresh_token()
+                if not self._accountNumber:
+                    _LOGGER.error(
+                        "Re-authentication failed - no account number obtained"
+                    )
+                    return None
+
+            status, data, error_text = await self._request_usage(
+                endpoint, start_date, end_date
+            )
+
+        if status != _HTTP_OK:
+            _LOGGER.error("Could not fetch consumption: %s", status)
+            _LOGGER.debug("Error response body: %s", error_text)
+            return None
+        return data
+
+    async def _ensure_authenticated(self) -> None:
+        """Authenticate if we don't yet have an account number."""
         # Serialize only the auth/token mutation: the regular poll and an
         # on-demand backfill can both land here around the same time, and
         # auth state is shared mutable instance state, not safe for
-        # concurrent access. The HTTP request itself is read-only against a
-        # snapshot of that state, so it runs outside the lock -- otherwise a
-        # long-running backfill request would stall regular polling.
+        # concurrent access.
         async with self._lock:
-            # If no account number, need to authenticate first
             if not self._accountNumber:
                 _LOGGER.debug(
                     "No account number found, starting authentication process"
@@ -254,8 +286,21 @@ class WatercareApi:
                 await self.get_refresh_token()
                 if not self._accountNumber:
                     _LOGGER.error("Authentication failed - no account number obtained")
-                    return None
 
+    async def _request_usage(
+        self,
+        endpoint: str,
+        start_date: str | None,
+        end_date: str | None,
+    ) -> tuple[int, str | None, str | None]:
+        """
+        Make a single usage request against a snapshot of the auth state.
+
+        Runs outside the lock -- it's read-only, and holding the lock here
+        would stall a concurrent regular poll behind a long-running backfill
+        request.
+        """
+        async with self._lock:
             account_number = self._accountNumber
             token = self._token
 
@@ -276,8 +321,6 @@ class WatercareApi:
                 data = await response.text()
                 _LOGGER.debug("API Response status: %s", response.status)
                 _LOGGER.debug("API Response data length: %s", len(data) if data else 0)
-                return data
+                return response.status, data, None
             error_text = await response.text()
-            _LOGGER.error("Could not fetch consumption: %s", response.status)
-            _LOGGER.debug("Error response body: %s", error_text)
-            return None
+            return response.status, None, error_text
