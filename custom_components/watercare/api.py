@@ -183,8 +183,8 @@ class WatercareApi:
             _LOGGER.debug("Refresh token retrieved successfully.")
             await self.get_accounts()
 
-    async def get_api_token(self) -> None:
-        """Get token from the Watercare API."""
+    async def get_api_token(self) -> bool:
+        """Get token from the Watercare API. Returns whether it succeeded."""
         token_data = {
             "grant_type": "refresh_token",
             "client_id": self._client_id,
@@ -200,8 +200,9 @@ class WatercareApi:
                     self._token = json_result["access_token"]
                     _LOGGER.debug("Access token retrieved successfully.")
                     await self.get_accounts()
-                else:
-                    _LOGGER.error("Failed to retrieve the token page.")
+                    return True
+                _LOGGER.error("Failed to retrieve the token page.")
+                return False
 
     async def get_accounts(self) -> None:
         """Get the first account that we see."""
@@ -253,11 +254,16 @@ class WatercareApi:
             # later poll would 401. Re-authenticate once and retry.
             _LOGGER.debug("Access token rejected (401); re-authenticating and retrying")
             async with self._lock:
-                if self._refresh_token:
-                    await self.get_api_token()
-                else:
+                # The refresh-token grant can itself fail (e.g. the refresh
+                # token has expired) without raising -- it just leaves
+                # _token/_accountNumber as they were, which would otherwise
+                # look like a no-op success and retry with the same stale
+                # token. Fall back to a full login whenever it doesn't
+                # actually get us a fresh token.
+                refreshed = bool(self._refresh_token) and await self.get_api_token()
+                if not refreshed:
                     await self.get_refresh_token()
-                if not self._accountNumber:
+                if not self._accountNumber or not self._token:
                     _LOGGER.error(
                         "Re-authentication failed - no account number obtained"
                     )
