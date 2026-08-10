@@ -166,9 +166,14 @@ async def test_get_data_returns_none_when_authentication_fails() -> None:
         side_effect=lambda: None
     )  # never sets _accountNumber
 
-    result = await api.get_data(endpoint="halfhourly")
+    # No routes registered: if get_data() proceeded to make a usage request
+    # despite failed auth, aioresponses would raise instead of letting a real
+    # network call slip through.
+    with aioresponses() as mocked:
+        result = await api.get_data(endpoint="halfhourly")
 
     assert result is None
+    mocked.assert_not_called()
 
 
 class _FakeResponse:

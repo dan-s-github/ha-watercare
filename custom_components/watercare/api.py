@@ -240,7 +240,8 @@ class WatercareApi:
             msg = "Invalid endpoint specified"
             raise ValueError(msg)
 
-        await self._ensure_authenticated()
+        if not await self._ensure_authenticated():
+            return None
 
         status, data, error_text = await self._request_usage(
             endpoint, start_date, end_date
@@ -272,12 +273,14 @@ class WatercareApi:
             return None
         return data
 
-    async def _ensure_authenticated(self) -> None:
+    async def _ensure_authenticated(self) -> bool:
         """Authenticate if we don't yet have an account number."""
-        # Serialize only the auth/token mutation: the regular poll and an
-        # on-demand backfill can both land here around the same time, and
-        # auth state is shared mutable instance state, not safe for
-        # concurrent access.
+        # Serialize the whole re-authentication flow, not just the state
+        # mutation: the regular poll and an on-demand backfill can both land
+        # here around the same time, and we don't want two concurrent OAuth
+        # logins racing over shared auth state. Only the single usage HTTP
+        # request in _request_usage() runs outside the lock, so a
+        # long-running backfill doesn't stall regular polling waiting on it.
         async with self._lock:
             if not self._accountNumber:
                 _LOGGER.debug(
@@ -286,6 +289,8 @@ class WatercareApi:
                 await self.get_refresh_token()
                 if not self._accountNumber:
                     _LOGGER.error("Authentication failed - no account number obtained")
+                    return False
+            return True
 
     async def _request_usage(
         self,
