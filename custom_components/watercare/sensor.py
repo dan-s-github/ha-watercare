@@ -191,21 +191,37 @@ class WatercareUsageSensor(SensorEntity):
             )
 
     async def _run_backfill(self) -> None:
-        # The backfill must land its (older) history before the regular
-        # update runs, since _async_push_hourly_statistic only appends
-        # points after the latest already-stored one -- doing the regular
-        # update first would set that watermark to "now" and cause the
-        # backfill's data to be silently discarded as already-superseded.
-        await self.async_backfill_halfhourly_history()
-        self.hass.config_entries.async_update_entry(
-            self._entry, data={**self._entry.data, CONF_HISTORY_BACKFILLED: True}
-        )
-        await self.async_update()
-        self.async_write_ha_state()
+        # Nothing awaits this background task, so an unhandled exception
+        # here would only surface as an asyncio "exception was never
+        # retrieved" warning with no entity state update at all -- catch,
+        # log, and still write whatever state was reached so the entity
+        # doesn't just sit unavailable with no explanation.
+        try:
+            # The backfill must land its (older) history before the regular
+            # update runs, since _async_push_hourly_statistic only appends
+            # points after the latest already-stored one -- doing the
+            # regular update first would set that watermark to "now" and
+            # cause the backfill's data to be silently discarded as
+            # already-superseded.
+            await self.async_backfill_halfhourly_history()
+            self.hass.config_entries.async_update_entry(
+                self._entry, data={**self._entry.data, CONF_HISTORY_BACKFILLED: True}
+            )
+            await self.async_update()
+        except Exception:
+            _LOGGER.exception("Watercare history backfill failed")
+        finally:
+            self.async_write_ha_state()
 
     async def _run_initial_update(self) -> None:
-        await self.async_update()
-        self.async_write_ha_state()
+        # See _run_backfill: nothing awaits this task, so failures need to
+        # be caught and logged here rather than left to escape silently.
+        try:
+            await self.async_update()
+        except Exception:
+            _LOGGER.exception("Watercare initial update failed")
+        finally:
+            self.async_write_ha_state()
 
     @property
     def name(self) -> str:
