@@ -110,17 +110,24 @@ async def async_setup_entry(
         CONF_HISTORY_BACKFILLED
     )
 
-    # When a backfill is pending, skip the immediate update-before-add: the
-    # backfill must run and land its (older) history first, since
-    # _async_push_hourly_statistic only appends points after the latest
-    # already-stored one -- doing the regular update first would set that
-    # watermark to "now" and cause the backfill's data to be silently
-    # discarded as already-superseded.
-    async_add_entities([sensor], update_before_add=not needs_backfill)
+    # Never block platform setup on update_before_add: the first update
+    # requires a full OAuth login (get_refresh_token() alone chains 4
+    # sequential HTTP round-trips to the Azure B2C login pages, plus
+    # get_accounts() and the usage request itself), which routinely takes
+    # long enough to trip HA's "setup is taking over 10 seconds" warning.
+    # Add the entity immediately and populate it via a background task
+    # instead.
+    async_add_entities([sensor], update_before_add=False)
 
     if needs_backfill:
 
         async def _run_backfill() -> None:
+            # The backfill must land its (older) history before the regular
+            # update runs, since _async_push_hourly_statistic only appends
+            # points after the latest already-stored one -- doing the
+            # regular update first would set that watermark to "now" and
+            # cause the backfill's data to be silently discarded as
+            # already-superseded.
             await sensor.async_backfill_halfhourly_history()
             hass.config_entries.async_update_entry(
                 entry, data={**entry.data, CONF_HISTORY_BACKFILLED: True}
@@ -130,6 +137,15 @@ async def async_setup_entry(
 
         entry.async_create_background_task(
             hass, _run_backfill(), "watercare_history_backfill"
+        )
+    else:
+
+        async def _run_initial_update() -> None:
+            await sensor.async_update()
+            sensor.async_write_ha_state()
+
+        entry.async_create_background_task(
+            hass, _run_initial_update(), "watercare_initial_update"
         )
 
     return True
