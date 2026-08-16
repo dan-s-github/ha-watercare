@@ -243,9 +243,7 @@ class WatercareUsageSensor(SensorEntity):
         directly always picks the correct offset for that date instead.
         POLL_HOURS_NZT happens to include 2am, which is also NZ's DST
         changeover hour -- on those two days a year it's either
-        nonexistent (spring forward) or ambiguous (fall back); pick the
-        DST side for the former and the later/std occurrence for the
-        latter, deterministically, rather than crashing.
+        nonexistent (spring forward) or ambiguous (fall back).
         """
         target_date = base_date + timedelta(days=day_offset)
         naive = datetime(  # noqa: DTZ001 -- localized below
@@ -254,8 +252,14 @@ class WatercareUsageSensor(SensorEntity):
         try:
             return NZ_TIMEZONE.localize(naive, is_dst=None)
         except pytz.exceptions.NonExistentTimeError:
-            return NZ_TIMEZONE.localize(naive, is_dst=True)
+            # e.g. NZ's own 2am-3am spring-forward gap: no valid instant at
+            # this wall-clock reading (localize(..., is_dst=True) would
+            # silently resolve to an hour *before* the gap, firing the poll
+            # early) -- use the first valid instant just after it instead.
+            return NZ_TIMEZONE.localize(naive + timedelta(hours=1), is_dst=None)
         except pytz.exceptions.AmbiguousTimeError:
+            # e.g. NZ's own fall-back 2am, which occurs twice -- prefer the
+            # later (std) occurrence.
             return NZ_TIMEZONE.localize(naive, is_dst=False)
 
     def _schedule_next_poll(self) -> None:

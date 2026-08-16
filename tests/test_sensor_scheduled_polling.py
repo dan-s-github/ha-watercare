@@ -97,12 +97,17 @@ def test_next_poll_time_handles_nonexistent_hour_on_spring_forward(
     Regression: 02:00 doesn't exist on NZ's spring-forward day.
 
     NZ DST starts at 2am on the last Sunday of September, which is also
-    one of POLL_HOURS_NZT.
+    one of POLL_HOURS_NZT. localize(is_dst=True) on the impossible 02:00
+    would silently resolve an hour *before* the gap (firing early) --
+    the first valid instant after it, 03:00 NZDT, must be used instead.
     """
     sensor = make_sensor()
     now_nz = nz_dt(2026, 9, 26, 20)
 
-    assert sensor._next_poll_time(now_nz) == dst_nz_dt(2026, 9, 27, 2, is_dst=True)
+    next_poll = sensor._next_poll_time(now_nz)
+
+    assert next_poll == nz_dt(2026, 9, 27, 3)
+    assert next_poll.utcoffset() == timedelta(hours=13)
 
 
 def test_next_poll_time_handles_ambiguous_hour_on_fall_back(
