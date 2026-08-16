@@ -12,6 +12,8 @@ from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticData
 from homeassistant.components.recorder.statistics import get_last_statistics
 from homeassistant.components.sensor import SensorEntity
+from homeassistant.helpers.event import async_track_point_in_time
+from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import VolumeConverter
 
 from .const import (
@@ -43,7 +45,16 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-SCAN_INTERVAL = timedelta(hours=12)
+# Watercare's halfhourly readings lag ~13.5h behind wall-clock time (measured
+# against the live API on 2026-08-16: at 13:04 NZT the latest reading was
+# still 23:30 the previous day) -- a poll before ~13:30 NZT can't yet see a
+# fully-published previous day. Rather than HA's default SCAN_INTERVAL, which
+# polls every 12h from whatever moment the entity happened to be added (so
+# could easily land both daily polls before that threshold), poll at fixed
+# NZ wall-clock times: 14:00 leaves margin past the threshold so at least one
+# poll/day sees a complete previous day, and 02:00 keeps a second poll for
+# intraday visibility even though it can't capture a complete day.
+POLL_HOURS_NZT = (2, 14)
 
 # The halfhourly endpoint silently caps each request at ~161 days regardless
 # of the requested range (it always starts exactly at the requested `from`
@@ -169,10 +180,16 @@ class WatercareUsageSensor(SensorEntity):
         self._endpoint = endpoint
         self._entry = entry
         self._needs_backfill = needs_backfill
+        self._unsub_scheduled_poll = None
+
+    @property
+    def should_poll(self) -> bool:
+        """Disable default interval polling; fixed NZ times are scheduled ourselves."""
+        return False
 
     async def async_added_to_hass(self) -> None:
         """
-        Kick off the sensor's first data fetch.
+        Kick off the sensor's first data fetch and schedule fixed-time polling.
 
         Runs from this lifecycle hook rather than from a task started
         alongside async_add_entities() in async_setup_entry so it can't
@@ -189,6 +206,41 @@ class WatercareUsageSensor(SensorEntity):
             self._entry.async_create_background_task(
                 self.hass, self._run_initial_update(), "watercare_initial_update"
             )
+        self._schedule_next_poll()
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Cancel the scheduled fixed-time poll."""
+        if self._unsub_scheduled_poll is not None:
+            self._unsub_scheduled_poll()
+            self._unsub_scheduled_poll = None
+
+    def _next_poll_time(self, now: datetime) -> datetime:
+        """Return the next of POLL_HOURS_NZT strictly after `now`, in NZ time."""
+        now_nz = now.astimezone(NZ_TIMEZONE)
+        candidates = []
+        for hour in POLL_HOURS_NZT:
+            candidate = now_nz.replace(hour=hour, minute=0, second=0, microsecond=0)
+            if candidate <= now_nz:
+                candidate += timedelta(days=1)
+            candidates.append(candidate)
+        return min(candidates)
+
+    def _schedule_next_poll(self) -> None:
+        next_poll = self._next_poll_time(dt_util.utcnow())
+        self._unsub_scheduled_poll = async_track_point_in_time(
+            self.hass, self._handle_scheduled_poll, next_poll
+        )
+
+    async def _handle_scheduled_poll(self, _now: datetime) -> None:
+        # Nothing awaits this callback, so failures need to be caught and
+        # logged here rather than left to escape silently -- see _run_backfill.
+        try:
+            await self.async_update()
+        except Exception:
+            _LOGGER.exception("Watercare scheduled update failed")
+        finally:
+            self.async_write_ha_state()
+            self._schedule_next_poll()
 
     async def _run_backfill(self) -> None:
         # Nothing awaits this background task, so an unhandled exception
