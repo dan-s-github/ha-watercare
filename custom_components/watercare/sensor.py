@@ -6,8 +6,10 @@ import calendar
 import json
 import logging
 from datetime import UTC, datetime, timedelta
+from datetime import date as date_type
 from typing import TYPE_CHECKING, Any
 
+import pytz
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticData
 from homeassistant.components.recorder.statistics import get_last_statistics
@@ -217,15 +219,47 @@ class WatercareUsageSensor(SensorEntity):
     def _next_poll_time(self, now: datetime) -> datetime:
         """Return the next of POLL_HOURS_NZT strictly after `now`, in NZ time."""
         now_nz = now.astimezone(NZ_TIMEZONE)
-        candidates = []
-        for hour in POLL_HOURS_NZT:
-            candidate = now_nz.replace(hour=hour, minute=0, second=0, microsecond=0)
-            if candidate <= now_nz:
-                candidate += timedelta(days=1)
-            candidates.append(candidate)
+        candidates = [
+            candidate
+            for day_offset in (0, 1)
+            for hour in POLL_HOURS_NZT
+            if (candidate := self._localize_nz(now_nz.date(), day_offset, hour))
+            > now_nz
+        ]
         return min(candidates)
 
+    @staticmethod
+    def _localize_nz(base_date: date_type, day_offset: int, hour: int) -> datetime:
+        """
+        Localize a naive NZ wall-clock datetime, DST-transition-safe.
+
+        Building a candidate via now_nz.replace(hour=...) would keep
+        now_nz's original NZST/NZDT offset even when the target lands on
+        the other side of a DST transition, silently shifting the actual
+        scheduled instant by an hour. Localizing the naive date/time
+        directly always picks the correct offset for that date instead.
+        POLL_HOURS_NZT happens to include 2am, which is also NZ's DST
+        changeover hour -- on those two days a year it's either
+        nonexistent (spring forward) or ambiguous (fall back); pick the
+        DST side for the former and the later/std occurrence for the
+        latter, deterministically, rather than crashing.
+        """
+        target_date = base_date + timedelta(days=day_offset)
+        naive = datetime(  # noqa: DTZ001 -- localized below
+            target_date.year, target_date.month, target_date.day, hour
+        )
+        try:
+            return NZ_TIMEZONE.localize(naive, is_dst=None)
+        except pytz.exceptions.NonExistentTimeError:
+            return NZ_TIMEZONE.localize(naive, is_dst=True)
+        except pytz.exceptions.AmbiguousTimeError:
+            return NZ_TIMEZONE.localize(naive, is_dst=False)
+
     def _schedule_next_poll(self) -> None:
+        # Guard against leaking a duplicate timer if this is ever called
+        # again before the previous one fires (e.g. a future reload path).
+        if self._unsub_scheduled_poll is not None:
+            self._unsub_scheduled_poll()
         next_poll = self._next_poll_time(dt_util.utcnow())
         self._unsub_scheduled_poll = async_track_point_in_time(
             self.hass, self._handle_scheduled_poll, next_poll
