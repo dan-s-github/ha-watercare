@@ -222,6 +222,73 @@ async def test_handle_scheduled_poll_logs_and_still_reschedules_on_failure(
     sensor._schedule_next_poll.assert_called_once()
 
 
+async def test_run_backfill_schedules_poll_only_after_completing(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    """
+    Regression: scheduling must wait for backfill, not race it.
+
+    Scheduling the fixed-time poll from async_added_to_hass() (rather than
+    from here, after backfill finishes) could let a scheduled poll fire
+    mid-backfill and advance the statistics watermark out from under
+    async_backfill_halfhourly_history() -- see its append-only warning.
+    """
+    sensor = make_sensor()
+    sensor._entry.data = {}
+    sensor.async_backfill_halfhourly_history = AsyncMock()
+    sensor.async_update = AsyncMock()
+    sensor.async_write_ha_state = MagicMock()
+    sensor._schedule_next_poll = MagicMock()
+
+    await sensor._run_backfill()
+
+    sensor.async_backfill_halfhourly_history.assert_awaited_once()
+    sensor._schedule_next_poll.assert_called_once()
+
+
+async def test_run_backfill_schedules_poll_even_on_failure(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    sensor = make_sensor()
+    sensor._entry.data = {}
+    sensor.async_backfill_halfhourly_history = AsyncMock(
+        side_effect=RuntimeError("boom")
+    )
+    sensor.async_write_ha_state = MagicMock()
+    sensor._schedule_next_poll = MagicMock()
+
+    await sensor._run_backfill()
+
+    sensor._schedule_next_poll.assert_called_once()
+
+
+async def test_run_initial_update_schedules_poll_after_completing(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    sensor = make_sensor()
+    sensor.async_update = AsyncMock()
+    sensor.async_write_ha_state = MagicMock()
+    sensor._schedule_next_poll = MagicMock()
+
+    await sensor._run_initial_update()
+
+    sensor.async_update.assert_awaited_once()
+    sensor._schedule_next_poll.assert_called_once()
+
+
+async def test_run_initial_update_schedules_poll_even_on_failure(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    sensor = make_sensor()
+    sensor.async_update = AsyncMock(side_effect=RuntimeError("boom"))
+    sensor.async_write_ha_state = MagicMock()
+    sensor._schedule_next_poll = MagicMock()
+
+    await sensor._run_initial_update()
+
+    sensor._schedule_next_poll.assert_called_once()
+
+
 async def test_will_remove_from_hass_cancels_scheduled_poll(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:

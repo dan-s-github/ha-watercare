@@ -191,13 +191,17 @@ class WatercareUsageSensor(SensorEntity):
 
     async def async_added_to_hass(self) -> None:
         """
-        Kick off the sensor's first data fetch and schedule fixed-time polling.
+        Kick off the sensor's first data fetch.
 
         Runs from this lifecycle hook rather than from a task started
         alongside async_add_entities() in async_setup_entry so it can't
         possibly run before hass/entity_id are set on this entity -- HA
         only calls async_added_to_hass() once the entity is fully added
-        to the platform.
+        to the platform. Fixed-time polling isn't scheduled here: it's
+        scheduled once the initial backfill/update task finishes (see
+        _run_backfill/_run_initial_update), so a scheduled poll firing
+        mid-backfill can't race async_backfill_halfhourly_history() and
+        advance the statistics watermark out from under it.
         """
         await super().async_added_to_hass()
         if self._needs_backfill:
@@ -208,7 +212,6 @@ class WatercareUsageSensor(SensorEntity):
             self._entry.async_create_background_task(
                 self.hass, self._run_initial_update(), "watercare_initial_update"
             )
-        self._schedule_next_poll()
 
     async def async_will_remove_from_hass(self) -> None:
         """Cancel the scheduled fixed-time poll."""
@@ -298,6 +301,7 @@ class WatercareUsageSensor(SensorEntity):
             _LOGGER.exception("Watercare history backfill failed")
         finally:
             self.async_write_ha_state()
+            self._schedule_next_poll()
 
     async def _run_initial_update(self) -> None:
         # See _run_backfill: nothing awaits this task, so failures need to
@@ -308,6 +312,7 @@ class WatercareUsageSensor(SensorEntity):
             _LOGGER.exception("Watercare initial update failed")
         finally:
             self.async_write_ha_state()
+            self._schedule_next_poll()
 
     @property
     def name(self) -> str:
