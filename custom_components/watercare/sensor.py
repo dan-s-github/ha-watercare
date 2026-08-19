@@ -47,16 +47,22 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-# Watercare's halfhourly readings lag ~13.5h behind wall-clock time (measured
-# against the live API on 2026-08-16: at 13:04 NZT the latest reading was
-# still 23:30 the previous day) -- a poll before ~13:30 NZT can't yet see a
-# fully-published previous day. Rather than HA's default SCAN_INTERVAL, which
-# polls every 12h from whatever moment the entity happened to be added (so
-# could easily land both daily polls before that threshold), poll at fixed
-# NZ wall-clock times: 14:00 leaves margin past the threshold so at least one
-# poll/day sees a complete previous day, and 02:00 keeps a second poll for
-# intraday visibility even though it can't capture a complete day.
-POLL_HOURS_NZT = (2, 14)
+# Watercare publishes the previous day's final halfhourly readings around
+# 06:00 NZT (measured against the live API 2026-08-17 to 2026-08-19: the
+# 05:3x poll each day still saw the previous day's data, and the 06:3x poll
+# already had the new day's 23:30 reading), but the exact time isn't fixed
+# enough to just pick a single margin. Rather than HA's default
+# SCAN_INTERVAL, which polls every 12h from whatever moment the entity
+# happened to be added (so could easily land both daily polls before
+# Watercare has published), poll hourly starting at POLL_START_HOUR_NZT
+# until a poll actually observes a complete previous NZ day (see
+# _is_data_fresh), then stop for the day -- self-correcting if the publish
+# time drifts, and no more API calls than needed once the data's in. If it
+# still hasn't shown up by POLL_RETRY_CUTOFF_HOUR_NZT, give up for the day
+# rather than retrying hourly indefinitely; try again at the next day's
+# start hour.
+POLL_START_HOUR_NZT = 6
+POLL_RETRY_CUTOFF_HOUR_NZT = 12
 
 # The halfhourly endpoint silently caps each request at ~161 days regardless
 # of the requested range (it always starts exactly at the requested `from`
@@ -183,6 +189,11 @@ class WatercareUsageSensor(SensorEntity):
         self._entry = entry
         self._needs_backfill = needs_backfill
         self._unsub_scheduled_poll = None
+        # Latest NZ calendar date seen in halfhourly readings -- drives
+        # _is_data_fresh's hourly-retry decision. Left unset by endpoints
+        # other than halfhourly, which don't publish on a characterized
+        # schedule (see POLL_START_HOUR_NZT).
+        self._latest_reading_date: date_type | None = None
 
     @property
     def should_poll(self) -> bool:
@@ -219,14 +230,41 @@ class WatercareUsageSensor(SensorEntity):
             self._unsub_scheduled_poll()
             self._unsub_scheduled_poll = None
 
+    def _is_data_fresh(self, now_nz: datetime) -> bool:
+        """
+        Whether the most recent update captured a complete previous NZ day.
+
+        Only halfhourly readings track this (see process_halfhourly_data)
+        -- it's the only endpoint whose publish timing has been
+        characterized (see POLL_START_HOUR_NZT). Other endpoints leave
+        _latest_reading_date unset and are treated as always fresh, so
+        they poll once per cycle instead of retrying hourly for a signal
+        they don't have.
+        """
+        if self._latest_reading_date is None:
+            return True
+        return self._latest_reading_date >= now_nz.date() - timedelta(days=1)
+
     def _next_poll_time(self, now: datetime) -> datetime:
-        """Return the next of POLL_HOURS_NZT strictly after `now`, in NZ time."""
+        """
+        Return the next poll time in NZ time.
+
+        Polls hourly from POLL_START_HOUR_NZT while the last update's data
+        is stale, up to and including POLL_RETRY_CUTOFF_HOUR_NZT; once
+        fresh (or the cutoff passes without it), the next poll is the next
+        day's POLL_START_HOUR_NZT.
+        """
         now_nz = now.astimezone(NZ_TIMEZONE)
+        if not self._is_data_fresh(now_nz) and now_nz.hour < POLL_RETRY_CUTOFF_HOUR_NZT:
+            return self._localize_nz(now_nz.date(), 0, now_nz.hour + 1)
         candidates = [
             candidate
             for day_offset in (0, 1)
-            for hour in POLL_HOURS_NZT
-            if (candidate := self._localize_nz(now_nz.date(), day_offset, hour))
+            if (
+                candidate := self._localize_nz(
+                    now_nz.date(), day_offset, POLL_START_HOUR_NZT
+                )
+            )
             > now_nz
         ]
         return min(candidates)
@@ -241,9 +279,11 @@ class WatercareUsageSensor(SensorEntity):
         the other side of a DST transition, silently shifting the actual
         scheduled instant by an hour. Localizing the naive date/time
         directly always picks the correct offset for that date instead.
-        POLL_HOURS_NZT happens to include 2am, which is also NZ's DST
-        changeover hour -- on those two days a year it's either
-        nonexistent (spring forward) or ambiguous (fall back).
+        NZ's own DST changeover happens at 2am, so on those two days a
+        year a naive 2am reading would be either nonexistent (spring
+        forward) or ambiguous (fall back); handled generically here in
+        case a poll hour ever lands on 2am (POLL_START_HOUR_NZT and the
+        hourly retries currently don't).
         """
         target_date = base_date + timedelta(days=day_offset)
         naive = datetime(  # noqa: DTZ001 -- localized below
@@ -911,6 +951,9 @@ class WatercareUsageSensor(SensorEntity):
         if not hourly_consumption:
             _LOGGER.warning("No valid halfhourly readings found")
             return
+
+        # Drives _is_data_fresh's hourly-retry decision.
+        self._latest_reading_date = max(hour.date() for hour in hourly_consumption)
 
         # Today's consumption so far, for the sensor's own state/attributes.
         today = datetime.now(NZ_TIMEZONE).date()

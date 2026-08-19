@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
+from datetime import date as date_type
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
@@ -53,76 +54,112 @@ def test_should_poll_is_disabled(
     assert sensor.should_poll is False
 
 
-def test_next_poll_time_picks_soonest_hour_same_day(
+def test_next_poll_time_picks_start_hour_same_day_when_fresh(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
+    """With no halfhourly data seen yet, freshness defaults to True."""
     sensor = make_sensor()
     now_nz = nz_dt(2026, 8, 16, 1)
 
-    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 16, 2)
+    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 16, 6)
 
 
-def test_next_poll_time_picks_later_hour_same_day(
-    make_sensor: Callable[..., WatercareUsageSensor],
-) -> None:
-    sensor = make_sensor()
-    now_nz = nz_dt(2026, 8, 16, 5)
-
-    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 16, 14)
-
-
-def test_next_poll_time_rolls_to_next_day_after_last_hour(
+def test_next_poll_time_rolls_to_next_day_when_past_start_hour_and_fresh(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
     sensor = make_sensor()
     now_nz = nz_dt(2026, 8, 16, 20)
 
-    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 17, 2)
+    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 17, 6)
 
 
-def test_next_poll_time_skips_immediate_reschedule_at_exact_boundary(
+def test_next_poll_time_skips_immediate_reschedule_at_start_hour_boundary(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
-    """Regression: firing exactly at 02:00 must not schedule right back at 02:00."""
+    """Regression: firing exactly at 06:00 must not schedule right back at 06:00."""
     sensor = make_sensor()
-    now_nz = nz_dt(2026, 8, 16, 2)
+    now_nz = nz_dt(2026, 8, 16, 6)
 
-    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 16, 14)
+    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 17, 6)
 
 
-def test_next_poll_time_handles_nonexistent_hour_on_spring_forward(
+def test_next_poll_time_retries_hourly_while_stale(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    sensor = make_sensor()
+    sensor._latest_reading_date = date_type(2026, 8, 14)  # two days stale
+    now_nz = nz_dt(2026, 8, 16, 6)
+
+    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 16, 7)
+
+
+def test_next_poll_time_still_retries_at_cutoff_hour_while_stale(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    """The cutoff hour itself is still polled -- only hours after it give up."""
+    sensor = make_sensor()
+    sensor._latest_reading_date = date_type(2026, 8, 14)
+    now_nz = nz_dt(2026, 8, 16, 11)
+
+    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 16, 12)
+
+
+def test_next_poll_time_gives_up_after_cutoff_hour_while_stale(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    """Regression: don't retry hourly forever if Watercare never publishes."""
+    sensor = make_sensor()
+    sensor._latest_reading_date = date_type(2026, 8, 14)
+    now_nz = nz_dt(2026, 8, 16, 12)
+
+    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 17, 6)
+
+
+def test_next_poll_time_stops_for_the_day_once_fresh(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    """Regression: catching up mid-morning shouldn't schedule another same-day poll."""
+    sensor = make_sensor()
+    now_nz = nz_dt(2026, 8, 16, 7)
+    sensor._latest_reading_date = now_nz.date() - timedelta(days=1)
+
+    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 17, 6)
+
+
+def test_localize_nz_handles_nonexistent_hour_on_spring_forward(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
     """
     Regression: 02:00 doesn't exist on NZ's spring-forward day.
 
-    NZ DST starts at 2am on the last Sunday of September, which is also
-    one of POLL_HOURS_NZT. localize(is_dst=True) on the impossible 02:00
-    would silently resolve an hour *before* the gap (firing early) --
-    the first valid instant after it, 03:00 NZDT, must be used instead.
+    NZ DST starts at 2am on the last Sunday of September. localize(...,
+    is_dst=True) on the impossible 02:00 would silently resolve an hour
+    *before* the gap (firing early) -- the first valid instant after it,
+    03:00 NZDT, must be used instead. None of the current poll hours land
+    on 2am, but _localize_nz must still handle it correctly for any hour.
     """
     sensor = make_sensor()
-    now_nz = nz_dt(2026, 9, 26, 20)
 
-    next_poll = sensor._next_poll_time(now_nz)
+    result = sensor._localize_nz(date_type(2026, 9, 26), 1, 2)
 
-    assert next_poll == nz_dt(2026, 9, 27, 3)
-    assert next_poll.utcoffset() == timedelta(hours=13)
+    assert result == nz_dt(2026, 9, 27, 3)
+    assert result.utcoffset() == timedelta(hours=13)
 
 
-def test_next_poll_time_handles_ambiguous_hour_on_fall_back(
+def test_localize_nz_handles_ambiguous_hour_on_fall_back(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
     """
     Regression: 02:00 occurs twice on NZ's fall-back day.
 
-    NZ DST ends at 3am on the first Sunday of April, so 02:00 (also a
-    POLL_HOURS_NZT slot) occurs twice that day.
+    NZ DST ends at 3am on the first Sunday of April, so 02:00 occurs
+    twice that day; the later (std) occurrence must be picked.
     """
     sensor = make_sensor()
-    now_nz = nz_dt(2026, 4, 4, 20)
 
-    assert sensor._next_poll_time(now_nz) == dst_nz_dt(2026, 4, 5, 2, is_dst=False)
+    result = sensor._localize_nz(date_type(2026, 4, 4), 1, 2)
+
+    assert result == dst_nz_dt(2026, 4, 5, 2, is_dst=False)
 
 
 def test_next_poll_time_uses_correct_offset_after_dst_transition(
@@ -136,13 +173,13 @@ def test_next_poll_time_uses_correct_offset_after_dst_transition(
     intended wall-clock target once the candidate crossed a DST change.
     """
     sensor = make_sensor()
-    # Just past the spring-forward transition; the 14:00 candidate must
+    # Just past the spring-forward transition; the 06:00 candidate must
     # carry NZDT (+13:00), not the pre-transition NZST (+12:00) offset.
     now_nz = dst_nz_dt(2026, 9, 27, 3, is_dst=True)
 
     next_poll = sensor._next_poll_time(now_nz)
 
-    assert next_poll == nz_dt(2026, 9, 27, 14)
+    assert next_poll == nz_dt(2026, 9, 27, 6)
     assert next_poll.utcoffset() == timedelta(hours=13)
 
 
@@ -165,7 +202,7 @@ def test_schedule_next_poll_registers_at_computed_time(
     fake_track_point_in_time.assert_called_once_with(
         sensor.hass,
         sensor._handle_scheduled_poll,
-        nz_dt(2026, 8, 16, 14),
+        nz_dt(2026, 8, 16, 6),
     )
     assert sensor._unsub_scheduled_poll is unsub_sentinel
 
