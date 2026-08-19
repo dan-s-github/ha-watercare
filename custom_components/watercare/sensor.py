@@ -305,8 +305,13 @@ class WatercareUsageSensor(SensorEntity):
     def _schedule_next_poll(self) -> None:
         # Guard against leaking a duplicate timer if this is ever called
         # again before the previous one fires (e.g. a future reload path).
+        # Clear the handle immediately after cancelling -- if _next_poll_time()
+        # or async_track_point_in_time() below raises, an already-called
+        # unsub left in place could be invoked again by
+        # async_will_remove_from_hass().
         if self._unsub_scheduled_poll is not None:
             self._unsub_scheduled_poll()
+            self._unsub_scheduled_poll = None
         next_poll = self._next_poll_time(dt_util.utcnow())
         self._unsub_scheduled_poll = async_track_point_in_time(
             self.hass, self._handle_scheduled_poll, next_poll

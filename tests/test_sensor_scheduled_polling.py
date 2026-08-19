@@ -8,13 +8,13 @@ from datetime import date as date_type
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from custom_components.watercare import sensor as watercare_sensor
 from custom_components.watercare.const import NZ_TIMEZONE
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-    import pytest
 
     from custom_components.watercare.sensor import WatercareUsageSensor
 
@@ -227,6 +227,35 @@ def test_schedule_next_poll_cancels_existing_timer_first(
 
     old_unsub.assert_called_once()
     assert sensor._unsub_scheduled_poll is not old_unsub
+
+
+def test_schedule_next_poll_clears_handle_before_registering_new_timer(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Regression: a failure after cancelling must not leave a stale unsub.
+
+    If async_track_point_in_time() raises, _unsub_scheduled_poll must
+    already be None rather than still pointing at the already-called old
+    unsub -- otherwise async_will_remove_from_hass() could call it again.
+    """
+    sensor = make_sensor()
+    fixed_utcnow = nz_dt(2026, 8, 16, 5).astimezone(UTC)
+    monkeypatch.setattr(watercare_sensor.dt_util, "utcnow", lambda: fixed_utcnow)
+    old_unsub = MagicMock(name="old_unsub")
+    sensor._unsub_scheduled_poll = old_unsub
+    monkeypatch.setattr(
+        watercare_sensor,
+        "async_track_point_in_time",
+        MagicMock(side_effect=RuntimeError("boom")),
+    )
+
+    with pytest.raises(RuntimeError):
+        sensor._schedule_next_poll()
+
+    old_unsub.assert_called_once()
+    assert sensor._unsub_scheduled_poll is None
 
 
 async def test_handle_scheduled_poll_updates_writes_state_and_reschedules(
