@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -213,6 +214,7 @@ async def test_process_halfhourly_data_handles_malformed_json(
 
 async def test_process_halfhourly_data_partial_last_day_not_marked_complete(
     make_sensor: Callable[..., WatercareUsageSensor],
+    patch_recorder: SimpleNamespace,
 ) -> None:
     """
     Regression: a lone 23:00 reading must not mark that day fresh.
@@ -220,7 +222,8 @@ async def test_process_halfhourly_data_partial_last_day_not_marked_complete(
     Watercare publishes half-hourly, so a day's last reading is 23:30 --
     an earlier 23:00-only reading (seen live: 23:00 landed 15 min before
     23:30) means the day isn't fully published yet, and _is_data_fresh
-    must keep retrying rather than stopping early.
+    must keep retrying rather than stopping early. With no complete day
+    in the response at all, no statistics may be pushed either.
     """
     sensor = make_sensor(endpoint="halfhourly")
     payload = [{"timestamp": nz_timestamp(days_ago=0, hour=23, minute=0), "litres": 20}]
@@ -228,6 +231,7 @@ async def test_process_halfhourly_data_partial_last_day_not_marked_complete(
     await sensor.process_halfhourly_data(json.dumps(payload))
 
     assert sensor._latest_reading_date is None
+    assert not patch_recorder.written
 
 
 async def test_process_halfhourly_data_marks_day_complete_once_last_slot_seen(
@@ -246,13 +250,68 @@ async def test_process_halfhourly_data_marks_day_complete_once_last_slot_seen(
 async def test_process_halfhourly_data_does_not_regress_known_complete_date(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
-    """Regression: no confirmed-complete day must not reset an already-known one."""
+    """Regression: an older confirmed day must not reset a newer already-known one."""
     sensor = make_sensor(endpoint="halfhourly")
     nz_now = datetime.now(NZ_TIMEZONE)
-    already_known = (nz_now - timedelta(days=2)).date()
+    already_known = (nz_now - timedelta(days=1)).date()
     sensor._latest_reading_date = already_known
-    payload = [{"timestamp": nz_timestamp_on(nz_now.date(), 23, 0), "litres": 20}]
+    older_complete = (nz_now - timedelta(days=3)).date()
+    payload = [{"timestamp": nz_timestamp_on(older_complete, 23, 30), "litres": 20}]
 
     await sensor.process_halfhourly_data(json.dumps(payload))
 
     assert sensor._latest_reading_date == already_known
+
+
+async def test_process_halfhourly_data_excludes_partial_trailing_day_from_push(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    patch_recorder: SimpleNamespace,
+) -> None:
+    """
+    Regression: a mid-publish poll must not write a partial trailing hour.
+
+    Observed live at 06:14: yesterday's readings up to 23:00 but no 23:30
+    yet. Pushing that bucket would advance the append-only watermark past
+    it, permanently excluding the late 23:30 litres from the cumulative
+    sums once the retry sees the complete day. The partial day is deferred;
+    the entity state still counts every reading.
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+    nz_now = datetime.now(NZ_TIMEZONE)
+    complete_day = (nz_now - timedelta(days=2)).date()
+    partial_day = (nz_now - timedelta(days=1)).date()
+    payload = [
+        {"timestamp": nz_timestamp_on(complete_day, 23, 30), "litres": 10},
+        {"timestamp": nz_timestamp_on(partial_day, 23, 0), "litres": 20},
+    ]
+
+    await sensor.process_halfhourly_data(json.dumps(payload))
+
+    points = patch_recorder.written["watercare:halfhourly_consumption"]
+    assert len(points) == 1  # only the complete day's bucket
+    assert points[0]["sum"] == 10
+    assert sensor._latest_reading_date == complete_day
+
+
+async def test_process_halfhourly_data_failed_push_leaves_day_stale(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    """
+    Regression: a failed statistics push must not mark the day fresh.
+
+    Advancing the freshness watermark before the push succeeds would stop
+    the retry ladder for the day with yesterday's statistics unwritten
+    (e.g. recorder not ready at boot).
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+    sensor._async_push_halfhourly_statistics = AsyncMock(
+        side_effect=RuntimeError("recorder not ready")
+    )
+    nz_now = datetime.now(NZ_TIMEZONE)
+    yesterday = (nz_now - timedelta(days=1)).date()
+    payload = [{"timestamp": nz_timestamp_on(yesterday, 23, 30), "litres": 20}]
+
+    with pytest.raises(RuntimeError):
+        await sensor.process_halfhourly_data(json.dumps(payload))
+
+    assert sensor._latest_reading_date is None

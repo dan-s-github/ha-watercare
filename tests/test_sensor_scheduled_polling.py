@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import UTC, datetime, timedelta
 from datetime import date as date_type
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
@@ -20,30 +21,8 @@ if TYPE_CHECKING:
 
 
 def nz_dt(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
-    """
-    Build a correctly-localized NZ-time datetime.
-
-    NZ_TIMEZONE is a pytz timezone -- passing it directly as `tzinfo=` to the
-    datetime() constructor (rather than via .localize()) silently attaches
-    the zone's historical LMT offset instead of the current NZST/NZDT one.
-    """
-    return NZ_TIMEZONE.localize(
-        datetime(year, month, day, hour, minute, 0)  # noqa: DTZ001 -- localize() below
-    )
-
-
-def dst_nz_dt(year: int, month: int, day: int, hour: int, *, is_dst: bool) -> datetime:
-    """
-    Build an NZ-time datetime for an ambiguous/nonexistent hour.
-
-    The two dates/hours a year that are ambiguous (fall back) or
-    nonexistent (spring forward) as naive wall-clock times, forcing the
-    side that must be picked explicitly.
-    """
-    return NZ_TIMEZONE.localize(
-        datetime(year, month, day, hour, 0, 0),  # noqa: DTZ001 -- localize() below
-        is_dst=is_dst,
-    )
+    """Build an NZ-time datetime."""
+    return datetime(year, month, day, hour, minute, 0, tzinfo=NZ_TIMEZONE)
 
 
 def test_should_poll_is_disabled(
@@ -54,266 +33,287 @@ def test_should_poll_is_disabled(
     assert sensor.should_poll is False
 
 
-def test_next_poll_time_picks_start_hour_same_day_when_fresh(
+def test_data_is_stale_before_any_complete_day_is_seen(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
-    """With no halfhourly data seen yet, freshness defaults to True."""
-    sensor = make_sensor()
-    now_nz = nz_dt(2026, 8, 16, 1)
+    """
+    Regression: a halfhourly sensor with no observed data must count as stale.
 
-    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 16, 6)
+    _latest_reading_date is in-memory only, so every HA restart re-enters
+    this state; treating it as fresh would skip the retry ladder after a
+    failed first update and leave the sensor empty until the next day's
+    start hour.
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+
+    assert sensor._is_data_fresh(nz_dt(2026, 8, 16, 7)) is False
 
 
-def test_next_poll_time_rolls_to_next_day_when_past_start_hour_and_fresh(
+def test_data_is_fresh_once_previous_day_captured(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
-    sensor = make_sensor()
-    now_nz = nz_dt(2026, 8, 16, 20)
-
-    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 17, 6)
-
-
-def test_next_poll_time_skips_immediate_reschedule_at_start_hour_boundary(
-    make_sensor: Callable[..., WatercareUsageSensor],
-) -> None:
-    """Regression: firing exactly at 06:00 must not schedule right back at 06:00."""
-    sensor = make_sensor()
-    now_nz = nz_dt(2026, 8, 16, 6)
-
-    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 17, 6)
-
-
-def test_next_poll_time_retries_quarter_hourly_during_start_hour_while_stale(
-    make_sensor: Callable[..., WatercareUsageSensor],
-) -> None:
-    """During POLL_START_HOUR_NZT's own hour, retries are every 15 min."""
-    sensor = make_sensor()
-    sensor._latest_reading_date = date_type(2026, 8, 14)  # two days stale
-    now_nz = nz_dt(2026, 8, 16, 6)
-
-    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 16, 6, 15)
-
-
-def test_next_poll_time_rolls_from_quarter_hourly_to_hourly_after_start_hour(
-    make_sensor: Callable[..., WatercareUsageSensor],
-) -> None:
-    """Once POLL_START_HOUR_NZT's hour is over, retries drop back to hourly."""
-    sensor = make_sensor()
-    sensor._latest_reading_date = date_type(2026, 8, 14)
-    now_nz = nz_dt(2026, 8, 16, 6, 45)
-
-    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 16, 7)
-
-
-def test_next_poll_time_still_retries_at_cutoff_hour_while_stale(
-    make_sensor: Callable[..., WatercareUsageSensor],
-) -> None:
-    """The cutoff hour itself is still polled -- only hours after it give up."""
-    sensor = make_sensor()
-    sensor._latest_reading_date = date_type(2026, 8, 14)
-    now_nz = nz_dt(2026, 8, 16, 11)
-
-    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 16, 12)
-
-
-def test_next_poll_time_gives_up_after_cutoff_hour_while_stale(
-    make_sensor: Callable[..., WatercareUsageSensor],
-) -> None:
-    """Regression: don't retry hourly forever if Watercare never publishes."""
-    sensor = make_sensor()
-    sensor._latest_reading_date = date_type(2026, 8, 14)
-    now_nz = nz_dt(2026, 8, 16, 12)
-
-    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 17, 6)
-
-
-def test_next_poll_time_stops_for_the_day_once_fresh(
-    make_sensor: Callable[..., WatercareUsageSensor],
-) -> None:
-    """Regression: catching up mid-morning shouldn't schedule another same-day poll."""
-    sensor = make_sensor()
+    sensor = make_sensor(endpoint="halfhourly")
     now_nz = nz_dt(2026, 8, 16, 7)
     sensor._latest_reading_date = now_nz.date() - timedelta(days=1)
 
-    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 17, 6)
+    assert sensor._is_data_fresh(now_nz) is True
 
 
-def test_localize_nz_handles_nonexistent_hour_on_spring_forward(
+def test_data_is_stale_when_days_behind(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
-    """
-    Regression: 02:00 doesn't exist on NZ's spring-forward day.
+    sensor = make_sensor(endpoint="halfhourly")
+    sensor._latest_reading_date = date_type(2026, 8, 14)  # two days stale
 
-    NZ DST starts at 2am on the last Sunday of September. localize(...,
-    is_dst=True) on the impossible 02:00 would silently resolve an hour
-    *before* the gap (firing early) -- the first valid instant after it,
-    03:00 NZDT, must be used instead. None of the current poll hours land
-    on 2am, but _localize_nz must still handle it correctly for any hour.
-    """
-    sensor = make_sensor()
-
-    result = sensor._localize_nz(date_type(2026, 9, 26), 1, 2)
-
-    assert result == nz_dt(2026, 9, 27, 3)
-    assert result.utcoffset() == timedelta(hours=13)
+    assert sensor._is_data_fresh(nz_dt(2026, 8, 16, 7)) is False
 
 
-def test_localize_nz_handles_ambiguous_hour_on_fall_back(
+def test_non_halfhourly_endpoints_are_always_fresh(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
-    """
-    Regression: 02:00 occurs twice on NZ's fall-back day.
+    """Endpoints without a characterized publish time never enter the retry ladder."""
+    sensor = make_sensor(endpoint="dailywithstats")
 
-    NZ DST ends at 3am on the first Sunday of April, so 02:00 occurs
-    twice that day; the later (std) occurrence must be picked.
-    """
-    sensor = make_sensor()
-
-    result = sensor._localize_nz(date_type(2026, 4, 4), 1, 2)
-
-    assert result == dst_nz_dt(2026, 4, 5, 2, is_dst=False)
+    assert sensor._is_data_fresh(nz_dt(2026, 8, 16, 7)) is True
 
 
-def test_next_poll_time_uses_correct_offset_after_dst_transition(
+@pytest.mark.parametrize(
+    ("hour", "minute", "expected"),
+    [
+        (6, 0, True),  # the daily slot
+        (6, 15, False),  # quarter slots are stale-retry only
+        (12, 0, False),
+        (18, 0, False),  # halfhourly has no secondary daily slot
+        (0, 0, False),
+    ],
+)
+def test_should_poll_now_fresh_halfhourly_polls_only_at_start_hour(
     make_sensor: Callable[..., WatercareUsageSensor],
+    hour: int,
+    minute: int,
+    expected: bool,  # noqa: FBT001 -- pytest parametrization
+) -> None:
+    sensor = make_sensor(endpoint="halfhourly")
+    now_nz = nz_dt(2026, 8, 16, hour, minute)
+    sensor._latest_reading_date = now_nz.date() - timedelta(days=1)
+
+    assert sensor._should_poll_now(now_nz) is expected
+
+
+@pytest.mark.parametrize(
+    ("hour", "minute", "expected"),
+    [
+        (6, 0, True),
+        (6, 15, True),  # quarter-hourly through the start hour
+        (6, 45, True),
+        (7, 0, True),  # then hourly
+        (7, 15, False),
+        (12, 0, True),  # the cutoff hour itself is still polled
+        (12, 15, False),
+        (13, 0, False),  # past the cutoff: give up for the day
+        (3, 0, False),  # before the window
+    ],
+)
+def test_should_poll_now_stale_halfhourly_follows_retry_ladder(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    hour: int,
+    minute: int,
+    expected: bool,  # noqa: FBT001 -- pytest parametrization
+) -> None:
+    sensor = make_sensor(endpoint="halfhourly")
+    sensor._latest_reading_date = date_type(2026, 8, 14)  # stale
+
+    assert sensor._should_poll_now(nz_dt(2026, 8, 16, hour, minute)) is expected
+
+
+@pytest.mark.parametrize(
+    ("hour", "minute", "expected"),
+    [
+        (3, 0, True),  # hourly recovery retries run at any hour
+        (14, 0, True),
+        (3, 15, False),  # but only on the hour
+    ],
+)
+def test_should_poll_now_retries_hourly_after_failed_update(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    hour: int,
+    minute: int,
+    expected: bool,  # noqa: FBT001 -- pytest parametrization
 ) -> None:
     """
-    Regression: a stale pre-transition offset must not leak into candidates.
+    Regression: a transient API failure must not leave the sensor stale all day.
 
-    The old replace()-based candidates kept `now`'s stale pre-transition
-    offset, silently firing the scheduled poll up to an hour off the
-    intended wall-clock target once the candidate crossed a DST change.
+    The SCAN_INTERVAL polling this scheduling replaced recovered from a
+    failed poll within 12h; the failed-update flag drives hourly retries.
     """
-    sensor = make_sensor()
-    # Just past the spring-forward transition; the 06:00 candidate must
-    # carry NZDT (+13:00), not the pre-transition NZST (+12:00) offset.
-    now_nz = dst_nz_dt(2026, 9, 27, 3, is_dst=True)
+    sensor = make_sensor(endpoint="halfhourly")
+    now_nz = nz_dt(2026, 8, 16, hour, minute)
+    sensor._latest_reading_date = now_nz.date() - timedelta(days=1)  # data fresh
+    sensor._last_update_failed = True
 
-    next_poll = sensor._next_poll_time(now_nz)
-
-    assert next_poll == nz_dt(2026, 9, 27, 6)
-    assert next_poll.utcoffset() == timedelta(hours=13)
+    assert sensor._should_poll_now(now_nz) is expected
 
 
-def test_schedule_next_poll_registers_at_computed_time(
+@pytest.mark.parametrize(
+    ("hour", "minute", "expected"),
+    [
+        (6, 0, True),
+        (18, 0, True),  # secondary slot preserves the old ~12h cadence
+        (7, 0, False),
+        (12, 0, False),
+    ],
+)
+def test_should_poll_now_other_endpoints_poll_twice_daily(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    hour: int,
+    minute: int,
+    expected: bool,  # noqa: FBT001 -- pytest parametrization
+) -> None:
+    sensor = make_sensor(endpoint="dailywithstats")
+
+    assert sensor._should_poll_now(nz_dt(2026, 8, 16, hour, minute)) is expected
+
+
+def test_schedule_polling_registers_quarter_hour_tick(
     make_sensor: Callable[..., WatercareUsageSensor],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sensor = make_sensor()
-    fixed_utcnow = nz_dt(2026, 8, 16, 5).astimezone(UTC)
-    monkeypatch.setattr(watercare_sensor.dt_util, "utcnow", lambda: fixed_utcnow)
-
     unsub_sentinel = MagicMock(name="unsub")
-    fake_track_point_in_time = MagicMock(return_value=unsub_sentinel)
+    fake_track_time_change = MagicMock(return_value=unsub_sentinel)
     monkeypatch.setattr(
-        watercare_sensor, "async_track_point_in_time", fake_track_point_in_time
+        watercare_sensor, "async_track_time_change", fake_track_time_change
     )
 
-    sensor._schedule_next_poll()
+    sensor._schedule_polling()
 
-    fake_track_point_in_time.assert_called_once_with(
+    fake_track_time_change.assert_called_once_with(
         sensor.hass,
-        sensor._handle_scheduled_poll,
-        nz_dt(2026, 8, 16, 6),
+        sensor._handle_scheduled_tick,
+        minute=[0, 15, 30, 45],
+        second=0,
     )
     assert sensor._unsub_scheduled_poll is unsub_sentinel
 
 
-def test_schedule_next_poll_cancels_existing_timer_first(
+def test_schedule_polling_is_idempotent(
     make_sensor: Callable[..., WatercareUsageSensor],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression: re-scheduling must not leak the previous timer."""
+    """Regression: a second call must not register a duplicate subscription."""
     sensor = make_sensor()
-    fixed_utcnow = nz_dt(2026, 8, 16, 5).astimezone(UTC)
-    monkeypatch.setattr(watercare_sensor.dt_util, "utcnow", lambda: fixed_utcnow)
-    old_unsub = MagicMock(name="old_unsub")
-    sensor._unsub_scheduled_poll = old_unsub
+    unsub_sentinel = MagicMock(name="unsub")
+    fake_track_time_change = MagicMock(return_value=unsub_sentinel)
     monkeypatch.setattr(
-        watercare_sensor,
-        "async_track_point_in_time",
-        MagicMock(return_value=MagicMock(name="new_unsub")),
+        watercare_sensor, "async_track_time_change", fake_track_time_change
     )
 
-    sensor._schedule_next_poll()
+    sensor._schedule_polling()
+    sensor._schedule_polling()
 
-    old_unsub.assert_called_once()
-    assert sensor._unsub_scheduled_poll is not old_unsub
-
-
-def test_schedule_next_poll_clears_handle_before_registering_new_timer(
-    make_sensor: Callable[..., WatercareUsageSensor],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Regression: a failure after cancelling must not leave a stale unsub.
-
-    If async_track_point_in_time() raises, _unsub_scheduled_poll must
-    already be None rather than still pointing at the already-called old
-    unsub -- otherwise async_will_remove_from_hass() could call it again.
-    """
-    sensor = make_sensor()
-    fixed_utcnow = nz_dt(2026, 8, 16, 5).astimezone(UTC)
-    monkeypatch.setattr(watercare_sensor.dt_util, "utcnow", lambda: fixed_utcnow)
-    old_unsub = MagicMock(name="old_unsub")
-    sensor._unsub_scheduled_poll = old_unsub
-    monkeypatch.setattr(
-        watercare_sensor,
-        "async_track_point_in_time",
-        MagicMock(side_effect=RuntimeError("boom")),
-    )
-
-    with pytest.raises(RuntimeError):
-        sensor._schedule_next_poll()
-
-    old_unsub.assert_called_once()
-    assert sensor._unsub_scheduled_poll is None
+    fake_track_time_change.assert_called_once()
+    assert sensor._unsub_scheduled_poll is unsub_sentinel
 
 
-async def test_handle_scheduled_poll_updates_writes_state_and_reschedules(
+async def test_handle_tick_skips_entirely_when_not_subscribed(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
+    """Regression: a tick firing around entity removal must not touch the API."""
     sensor = make_sensor()
     sensor.async_update = AsyncMock()
     sensor.async_write_ha_state = MagicMock()
-    sensor._schedule_next_poll = MagicMock()
 
-    await sensor._handle_scheduled_poll(datetime(2026, 8, 16, 14, 0, 0, tzinfo=UTC))
+    await sensor._handle_scheduled_tick(nz_dt(2026, 8, 16, 6))
+
+    sensor.async_update.assert_not_awaited()
+    sensor.async_write_ha_state.assert_not_called()
+
+
+async def test_handle_tick_skips_api_outside_poll_slots(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    sensor = make_sensor(endpoint="halfhourly")
+    sensor._unsub_scheduled_poll = MagicMock(name="unsub")
+    sensor._latest_reading_date = date_type(2026, 8, 15)
+    sensor.async_update = AsyncMock()
+    sensor.async_write_ha_state = MagicMock()
+
+    # Fresh data, mid-afternoon: not a poll slot.
+    await sensor._handle_scheduled_tick(nz_dt(2026, 8, 16, 14))
+
+    sensor.async_update.assert_not_awaited()
+    sensor.async_write_ha_state.assert_not_called()
+
+
+async def test_handle_tick_updates_and_writes_state_at_poll_slot(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    sensor = make_sensor(endpoint="halfhourly")
+    sensor._unsub_scheduled_poll = MagicMock(name="unsub")
+    sensor._latest_reading_date = date_type(2026, 8, 15)
+    sensor.async_update = AsyncMock()
+    sensor.async_write_ha_state = MagicMock()
+
+    await sensor._handle_scheduled_tick(nz_dt(2026, 8, 16, 6))
 
     sensor.async_update.assert_awaited_once()
     sensor.async_write_ha_state.assert_called_once()
-    sensor._schedule_next_poll.assert_called_once()
 
 
-async def test_handle_scheduled_poll_logs_and_still_reschedules_on_failure(
+async def test_handle_tick_logs_and_still_writes_state_on_failure(
     make_sensor: Callable[..., WatercareUsageSensor],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Regression: a failed scheduled update must not abandon future polling."""
-    sensor = make_sensor()
+    sensor = make_sensor(endpoint="halfhourly")
+    sensor._unsub_scheduled_poll = MagicMock(name="unsub")
+    sensor._latest_reading_date = date_type(2026, 8, 15)
     sensor.async_update = AsyncMock(side_effect=RuntimeError("boom"))
     sensor.async_write_ha_state = MagicMock()
-    sensor._schedule_next_poll = MagicMock()
 
     with caplog.at_level(logging.ERROR):
-        await sensor._handle_scheduled_poll(datetime(2026, 8, 16, 14, 0, 0, tzinfo=UTC))
+        await sensor._handle_scheduled_tick(nz_dt(2026, 8, 16, 6))
 
     assert any(
         "Watercare scheduled update failed" in message for message in caplog.messages
     )
     sensor.async_write_ha_state.assert_called_once()
-    sensor._schedule_next_poll.assert_called_once()
 
 
-async def test_run_backfill_schedules_poll_only_after_completing(
+async def test_handle_tick_does_not_write_state_after_unsubscribe_mid_update(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    """
+    Regression: removal during an in-flight update must not write state.
+
+    async_will_remove_from_hass can run while the tick's async_update is
+    awaiting the API; the cleared unsub handle signals the tick to stop.
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+    sensor._unsub_scheduled_poll = MagicMock(name="unsub")
+    sensor._latest_reading_date = date_type(2026, 8, 15)
+
+    async def _unsubscribe_mid_update() -> None:
+        sensor._unsub_scheduled_poll = None
+
+    sensor.async_update = AsyncMock(side_effect=_unsubscribe_mid_update)
+    sensor.async_write_ha_state = MagicMock()
+
+    await sensor._handle_scheduled_tick(nz_dt(2026, 8, 16, 6))
+
+    sensor.async_update.assert_awaited_once()
+    sensor.async_write_ha_state.assert_not_called()
+
+
+async def test_run_backfill_schedules_polling_only_after_completing(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
     """
     Regression: scheduling must wait for backfill, not race it.
 
-    Scheduling the fixed-time poll from async_added_to_hass() (rather than
-    from here, after backfill finishes) could let a scheduled poll fire
-    mid-backfill and advance the statistics watermark out from under
+    Registering the poll subscription from async_added_to_hass() (rather
+    than from here, after backfill finishes) could let a scheduled poll
+    fire mid-backfill and advance the statistics watermark out from under
     async_backfill_halfhourly_history() -- see its append-only warning.
     """
     sensor = make_sensor()
@@ -321,15 +321,15 @@ async def test_run_backfill_schedules_poll_only_after_completing(
     sensor.async_backfill_halfhourly_history = AsyncMock()
     sensor.async_update = AsyncMock()
     sensor.async_write_ha_state = MagicMock()
-    sensor._schedule_next_poll = MagicMock()
+    sensor._schedule_polling = MagicMock()
 
     await sensor._run_backfill()
 
     sensor.async_backfill_halfhourly_history.assert_awaited_once()
-    sensor._schedule_next_poll.assert_called_once()
+    sensor._schedule_polling.assert_called_once()
 
 
-async def test_run_backfill_schedules_poll_even_on_failure(
+async def test_run_backfill_schedules_polling_even_on_failure(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
     sensor = make_sensor()
@@ -338,41 +338,82 @@ async def test_run_backfill_schedules_poll_even_on_failure(
         side_effect=RuntimeError("boom")
     )
     sensor.async_write_ha_state = MagicMock()
-    sensor._schedule_next_poll = MagicMock()
+    sensor._schedule_polling = MagicMock()
 
     await sensor._run_backfill()
 
-    sensor._schedule_next_poll.assert_called_once()
+    sensor._schedule_polling.assert_called_once()
 
 
-async def test_run_initial_update_schedules_poll_after_completing(
+async def test_run_backfill_cancellation_skips_scheduling(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    """
+    Regression: unloading the entry mid-backfill must not leave polling armed.
+
+    The config entry cancels its background tasks on unload; the resulting
+    CancelledError must propagate and skip both the state write and the
+    subscription registration, or a defunct entity would keep polling the
+    API (and racing its replacement's statistics watermark) forever.
+    """
+    sensor = make_sensor()
+    sensor._entry.data = {}
+    sensor.async_backfill_halfhourly_history = AsyncMock(
+        side_effect=asyncio.CancelledError
+    )
+    sensor.async_write_ha_state = MagicMock()
+    sensor._schedule_polling = MagicMock()
+
+    with pytest.raises(asyncio.CancelledError):
+        await sensor._run_backfill()
+
+    sensor.async_write_ha_state.assert_not_called()
+    sensor._schedule_polling.assert_not_called()
+
+
+async def test_run_initial_update_schedules_polling_after_completing(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
     sensor = make_sensor()
     sensor.async_update = AsyncMock()
     sensor.async_write_ha_state = MagicMock()
-    sensor._schedule_next_poll = MagicMock()
+    sensor._schedule_polling = MagicMock()
 
     await sensor._run_initial_update()
 
     sensor.async_update.assert_awaited_once()
-    sensor._schedule_next_poll.assert_called_once()
+    sensor._schedule_polling.assert_called_once()
 
 
-async def test_run_initial_update_schedules_poll_even_on_failure(
+async def test_run_initial_update_schedules_polling_even_on_failure(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
     sensor = make_sensor()
     sensor.async_update = AsyncMock(side_effect=RuntimeError("boom"))
     sensor.async_write_ha_state = MagicMock()
-    sensor._schedule_next_poll = MagicMock()
+    sensor._schedule_polling = MagicMock()
 
     await sensor._run_initial_update()
 
-    sensor._schedule_next_poll.assert_called_once()
+    sensor._schedule_polling.assert_called_once()
 
 
-async def test_will_remove_from_hass_cancels_scheduled_poll(
+async def test_run_initial_update_cancellation_skips_scheduling(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    sensor = make_sensor()
+    sensor.async_update = AsyncMock(side_effect=asyncio.CancelledError)
+    sensor.async_write_ha_state = MagicMock()
+    sensor._schedule_polling = MagicMock()
+
+    with pytest.raises(asyncio.CancelledError):
+        await sensor._run_initial_update()
+
+    sensor.async_write_ha_state.assert_not_called()
+    sensor._schedule_polling.assert_not_called()
+
+
+async def test_will_remove_from_hass_cancels_subscription(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
     sensor = make_sensor()
