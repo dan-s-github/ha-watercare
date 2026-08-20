@@ -271,17 +271,11 @@ class WatercareUsageSensor(SensorEntity):
             for hour, minute in POLL_RETRY_SLOTS_NZT:
                 if (hour, minute) > (now_nz.hour, now_nz.minute):
                     return self._localize_nz(now_nz.date(), 0, hour, minute)
-        candidates = [
-            candidate
+        candidates = (
+            self._localize_nz(now_nz.date(), day_offset, POLL_START_HOUR_NZT)
             for day_offset in (0, 1)
-            if (
-                candidate := self._localize_nz(
-                    now_nz.date(), day_offset, POLL_START_HOUR_NZT
-                )
-            )
-            > now_nz
-        ]
-        return min(candidates)
+        )
+        return min(candidate for candidate in candidates if candidate > now_nz)
 
     @staticmethod
     def _localize_nz(
@@ -826,9 +820,23 @@ class WatercareUsageSensor(SensorEntity):
 
     def _bucket_hourly_readings(
         self, readings: list[dict[str, Any]]
-    ) -> dict[datetime, float]:
-        """Bucket a list of {timestamp, litres} readings into hourly sums."""
+    ) -> tuple[dict[datetime, float], date_type | None]:
+        """
+        Bucket a list of {timestamp, litres} readings into hourly sums.
+
+        Also returns the latest NZ date whose halfhourly data is confirmed
+        fully published, computed in the same pass over `readings` rather
+        than re-parsing timestamps separately (this can run on years of
+        backfilled readings, not just a single poll's response). A day
+        only counts as complete once its final half-hour slot (23:30 NZT)
+        has been published -- an earlier partial reading for "today" (e.g.
+        23:00 with no 23:30 yet, as seen live: Watercare briefly published
+        a 23:00-only reading before 23:30 landed 15 min later) must not be
+        mistaken for a complete day, or _is_data_fresh would stop retrying
+        before the last half-hour actually arrives.
+        """
         hourly_consumption: dict[datetime, float] = {}
+        complete_dates: set[date_type] = set()
         for reading in readings:
             reading_time = self._parse_reading_time(reading.get("timestamp"))
             if reading_time is None:
@@ -838,29 +846,9 @@ class WatercareUsageSensor(SensorEntity):
             hourly_consumption[hour_start] = (
                 hourly_consumption.get(hour_start, 0) + litres
             )
-        return hourly_consumption
-
-    def _latest_complete_reading_date(
-        self, readings: list[dict[str, Any]]
-    ) -> date_type | None:
-        """
-        Latest NZ date whose halfhourly data is confirmed fully published.
-
-        A day only counts as complete once its final half-hour slot (23:30
-        NZT) has been published -- an earlier partial reading for "today"
-        (e.g. 23:00 with no 23:30 yet, as seen live: Watercare briefly
-        published a 23:00-only reading before 23:30 landed 15 min later)
-        must not be mistaken for a complete day, or _is_data_fresh would
-        stop retrying before the last half-hour actually arrives.
-        """
-        complete_dates = {
-            reading_time.date()
-            for reading in readings
-            if (reading_time := self._parse_reading_time(reading.get("timestamp")))
-            is not None
-            and (reading_time.hour, reading_time.minute) == (23, 30)
-        }
-        return max(complete_dates, default=None)
+            if (reading_time.hour, reading_time.minute) == (23, 30):
+                complete_dates.add(reading_time.date())
+        return hourly_consumption, max(complete_dates, default=None)
 
     async def _async_last_statistic_sum(
         self, statistic_id: str
@@ -997,7 +985,9 @@ class WatercareUsageSensor(SensorEntity):
             _LOGGER.warning("No halfhourly readings found")
             return
 
-        hourly_consumption = self._bucket_hourly_readings(readings)
+        hourly_consumption, latest_complete_date = self._bucket_hourly_readings(
+            readings
+        )
         if not hourly_consumption:
             _LOGGER.warning("No valid halfhourly readings found")
             return
@@ -1006,7 +996,6 @@ class WatercareUsageSensor(SensorEntity):
         # response with no confirmed-complete day, or one older than what's
         # already known (e.g. a truncated/narrower window than expected),
         # must not regress an already-known complete date.
-        latest_complete_date = self._latest_complete_reading_date(readings)
         if latest_complete_date is not None and (
             self._latest_reading_date is None
             or latest_complete_date > self._latest_reading_date
@@ -1096,7 +1085,7 @@ class WatercareUsageSensor(SensorEntity):
             _LOGGER.warning("Backfill found no historical data")
             return
 
-        hourly_consumption = self._bucket_hourly_readings(
+        hourly_consumption, _latest_complete_date = self._bucket_hourly_readings(
             [
                 {"timestamp": timestamp, "litres": litres}
                 for timestamp, litres in all_readings.items()

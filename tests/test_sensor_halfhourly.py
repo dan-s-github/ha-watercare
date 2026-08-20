@@ -28,11 +28,29 @@ def test_bucket_hourly_readings_sums_half_hours_into_hours(
 ) -> None:
     sensor = make_sensor(endpoint="halfhourly")
 
-    buckets = sensor._bucket_hourly_readings(readings)
+    buckets, latest_complete_date = sensor._bucket_hourly_readings(readings)
 
     assert len(buckets) == 3
     sums_in_order = [buckets[hour] for hour in sorted(buckets)]
     assert sums_in_order == [35, 40, 5]  # (20+15), (30+10), (5)
+    assert latest_complete_date is None  # fixture has no 23:30 NZT reading
+
+
+def test_bucket_hourly_readings_finds_latest_complete_date_in_same_pass(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    sensor = make_sensor(endpoint="halfhourly")
+    nz_now = datetime.now(NZ_TIMEZONE)
+    yesterday = (nz_now - timedelta(days=1)).date()
+    readings = [
+        {"timestamp": nz_timestamp_on(yesterday, 23, 0), "litres": 5},
+        {"timestamp": nz_timestamp_on(yesterday, 23, 30), "litres": 5},
+    ]
+
+    buckets, latest_complete_date = sensor._bucket_hourly_readings(readings)
+
+    assert len(buckets) == 1  # both fall in the same hourly bucket
+    assert latest_complete_date == yesterday
 
 
 async def test_push_hourly_statistic_no_existing_watermark_writes_all(
@@ -41,7 +59,7 @@ async def test_push_hourly_statistic_no_existing_watermark_writes_all(
     patch_recorder: SimpleNamespace,
 ) -> None:
     sensor = make_sensor(endpoint="halfhourly")
-    buckets = sensor._bucket_hourly_readings(readings)
+    buckets, _ = sensor._bucket_hourly_readings(readings)
 
     new_count = await sensor._async_push_hourly_statistic(
         buckets,
@@ -64,7 +82,7 @@ async def test_push_hourly_statistic_continues_from_existing_watermark(
 ) -> None:
     """Regression: must skip buckets at/before the watermark, continuing the sum."""
     sensor = make_sensor(endpoint="halfhourly")
-    buckets = sensor._bucket_hourly_readings(readings)
+    buckets, _ = sensor._bucket_hourly_readings(readings)
     first_bucket_start = min(buckets)
     patch_recorder.last_statistics["watercare:halfhourly_consumption"] = (
         1000.0,
@@ -92,7 +110,7 @@ async def test_push_hourly_statistic_nothing_new_writes_nothing(
 ) -> None:
     """Regression: must not call async_add_external_statistics with nothing new."""
     sensor = make_sensor(endpoint="halfhourly")
-    buckets = sensor._bucket_hourly_readings(readings)
+    buckets, _ = sensor._bucket_hourly_readings(readings)
     last_bucket_start = max(buckets)
     patch_recorder.last_statistics["watercare:halfhourly_consumption"] = (
         500.0,
@@ -118,7 +136,7 @@ async def test_push_hourly_statistic_zero_rate_gate_skips_entirely(
     patch_recorder: SimpleNamespace,
 ) -> None:
     sensor = make_sensor(endpoint="halfhourly")
-    buckets = sensor._bucket_hourly_readings(readings)
+    buckets, _ = sensor._bucket_hourly_readings(readings)
 
     new_count = await sensor._async_push_hourly_statistic(
         buckets,
@@ -139,7 +157,7 @@ async def test_push_halfhourly_statistics_writes_all_four_series(
     patch_recorder: SimpleNamespace,
 ) -> None:
     sensor = make_sensor(endpoint="halfhourly")
-    buckets = sensor._bucket_hourly_readings(readings)
+    buckets, _ = sensor._bucket_hourly_readings(readings)
 
     new_count = await sensor._async_push_halfhourly_statistics(buckets)
 

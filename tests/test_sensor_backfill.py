@@ -70,7 +70,7 @@ async def test_backfill_warns_when_existing_watermark_blocks_older_data(
     sensor._api.get_data = AsyncMock(side_effect=[CHUNK_RESPONSE, "[]"])
 
     readings = json.loads(CHUNK_RESPONSE)
-    buckets = sensor._bucket_hourly_readings(readings)
+    buckets, _ = sensor._bucket_hourly_readings(readings)
     newest_bucket = max(buckets)
     # All four series already have a watermark newer than everything backfill
     # just collected -- as if regular polling already ran to completion.
