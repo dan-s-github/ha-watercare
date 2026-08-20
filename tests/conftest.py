@@ -34,18 +34,21 @@ def load_fixture(name: str) -> str:
     return (FIXTURES_DIR / name).read_text()
 
 
-def nz_timestamp(days_ago: int, hour: int) -> str:
-    """Build a UTC API timestamp landing `days_ago` days back at `hour` in NZ time."""
+def nz_timestamp(days_ago: int, hour: int, minute: int = 0) -> str:
+    """
+    Build a UTC API timestamp landing `days_ago` days back at `hour`:`minute` NZ time.
+
+    Must localize the naive NZ wall-clock datetime via NZ_TIMEZONE.localize()
+    rather than passing NZ_TIMEZONE directly as `tzinfo=` -- pytz zones
+    silently attach their historical LMT offset (NZ: +11:39, not +12:00)
+    when used that way, skewing the resulting UTC timestamp by ~21 min.
+    """
     nz_now = datetime.now(NZ_TIMEZONE)
     target_date = (nz_now - timedelta(days=days_ago)).date()
-    nz_dt = datetime(
-        target_date.year,
-        target_date.month,
-        target_date.day,
-        hour,
-        0,
-        0,
-        tzinfo=NZ_TIMEZONE,
+    nz_dt = NZ_TIMEZONE.localize(
+        datetime(  # noqa: DTZ001 -- localized above
+            target_date.year, target_date.month, target_date.day, hour, minute, 0
+        )
     )
     return nz_dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 

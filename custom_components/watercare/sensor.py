@@ -810,29 +810,57 @@ class WatercareUsageSensor(SensorEntity):
             empty_warning=None,
         )
 
+    @staticmethod
+    def _parse_reading_time(timestamp_str: str | None) -> datetime | None:
+        """Parse a halfhourly reading's UTC API timestamp into NZ local time."""
+        if not timestamp_str:
+            return None
+        try:
+            reading_time = datetime.strptime(
+                timestamp_str, "%Y-%m-%dT%H:%M:%S.%fZ"
+            ).replace(tzinfo=UTC)
+        except ValueError:
+            _LOGGER.warning("Failed to parse timestamp %s", timestamp_str)
+            return None
+        return reading_time.astimezone(NZ_TIMEZONE)
+
     def _bucket_hourly_readings(
         self, readings: list[dict[str, Any]]
     ) -> dict[datetime, float]:
         """Bucket a list of {timestamp, litres} readings into hourly sums."""
         hourly_consumption: dict[datetime, float] = {}
         for reading in readings:
-            timestamp_str = reading.get("timestamp")
-            if not timestamp_str:
+            reading_time = self._parse_reading_time(reading.get("timestamp"))
+            if reading_time is None:
                 continue
-            try:
-                reading_time = datetime.strptime(
-                    timestamp_str, "%Y-%m-%dT%H:%M:%S.%fZ"
-                ).replace(tzinfo=UTC)
-            except ValueError:
-                _LOGGER.warning("Failed to parse timestamp %s", timestamp_str)
-                continue
-            reading_time = reading_time.astimezone(NZ_TIMEZONE)
             hour_start = reading_time.replace(minute=0, second=0, microsecond=0)
             litres = reading.get("litres", 0)
             hourly_consumption[hour_start] = (
                 hourly_consumption.get(hour_start, 0) + litres
             )
         return hourly_consumption
+
+    def _latest_complete_reading_date(
+        self, readings: list[dict[str, Any]]
+    ) -> date_type | None:
+        """
+        Latest NZ date whose halfhourly data is confirmed fully published.
+
+        A day only counts as complete once its final half-hour slot (23:30
+        NZT) has been published -- an earlier partial reading for "today"
+        (e.g. 23:00 with no 23:30 yet, as seen live: Watercare briefly
+        published a 23:00-only reading before 23:30 landed 15 min later)
+        must not be mistaken for a complete day, or _is_data_fresh would
+        stop retrying before the last half-hour actually arrives.
+        """
+        complete_dates = {
+            reading_time.date()
+            for reading in readings
+            if (reading_time := self._parse_reading_time(reading.get("timestamp")))
+            is not None
+            and (reading_time.hour, reading_time.minute) == (23, 30)
+        }
+        return max(complete_dates, default=None)
 
     async def _async_last_statistic_sum(
         self, statistic_id: str
@@ -974,8 +1002,12 @@ class WatercareUsageSensor(SensorEntity):
             _LOGGER.warning("No valid halfhourly readings found")
             return
 
-        # Drives _is_data_fresh's hourly-retry decision.
-        self._latest_reading_date = max(hour.date() for hour in hourly_consumption)
+        # Drives _is_data_fresh's retry decision. Only advances forward: a
+        # response with no confirmed-complete day (e.g. a narrower window
+        # than expected) must not regress an already-known complete date.
+        latest_complete_date = self._latest_complete_reading_date(readings)
+        if latest_complete_date is not None:
+            self._latest_reading_date = latest_complete_date
 
         # Today's consumption so far, for the sensor's own state/attributes.
         today = datetime.now(NZ_TIMEZONE).date()
