@@ -237,6 +237,7 @@ class WatercareUsageSensor(SensorEntity):
 
     async def async_will_remove_from_hass(self) -> None:
         """Cancel the scheduled fixed-time poll."""
+        await super().async_will_remove_from_hass()
         if self._unsub_scheduled_poll is not None:
             self._unsub_scheduled_poll()
             self._unsub_scheduled_poll = None
@@ -310,7 +311,8 @@ class WatercareUsageSensor(SensorEntity):
             # e.g. NZ's own 2am-3am spring-forward gap: no valid instant at
             # this wall-clock reading (localize(..., is_dst=True) would
             # silently resolve to an hour *before* the gap, firing the poll
-            # early) -- use the first valid instant just after it instead.
+            # early) -- shift forward by an hour (preserving minutes) into
+            # the first valid wall-clock reading past the gap instead.
             return NZ_TIMEZONE.localize(naive + timedelta(hours=1), is_dst=None)
         except pytz.exceptions.AmbiguousTimeError:
             # e.g. NZ's own fall-back 2am, which occurs twice -- prefer the
