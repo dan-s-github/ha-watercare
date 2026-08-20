@@ -1003,10 +1003,14 @@ class WatercareUsageSensor(SensorEntity):
             return
 
         # Drives _is_data_fresh's retry decision. Only advances forward: a
-        # response with no confirmed-complete day (e.g. a narrower window
-        # than expected) must not regress an already-known complete date.
+        # response with no confirmed-complete day, or one older than what's
+        # already known (e.g. a truncated/narrower window than expected),
+        # must not regress an already-known complete date.
         latest_complete_date = self._latest_complete_reading_date(readings)
-        if latest_complete_date is not None:
+        if latest_complete_date is not None and (
+            self._latest_reading_date is None
+            or latest_complete_date > self._latest_reading_date
+        ):
             self._latest_reading_date = latest_complete_date
 
         # Today's consumption so far, for the sensor's own state/attributes.

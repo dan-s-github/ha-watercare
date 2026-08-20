@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from custom_components.watercare.const import NZ_TIMEZONE
-from tests.conftest import load_fixture, nz_timestamp
+from tests.conftest import load_fixture, nz_timestamp, nz_timestamp_on
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -216,16 +216,13 @@ async def test_process_halfhourly_data_marks_day_complete_once_last_slot_seen(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
     sensor = make_sensor(endpoint="halfhourly")
-    payload = [
-        {"timestamp": nz_timestamp(days_ago=1, hour=23, minute=30), "litres": 20}
-    ]
+    nz_now = datetime.now(NZ_TIMEZONE)
+    yesterday = (nz_now - timedelta(days=1)).date()
+    payload = [{"timestamp": nz_timestamp_on(yesterday, 23, 30), "litres": 20}]
 
     await sensor.process_halfhourly_data(json.dumps(payload))
 
-    assert (
-        sensor._latest_reading_date
-        == (datetime.now(NZ_TIMEZONE) - timedelta(days=1)).date()
-    )
+    assert sensor._latest_reading_date == yesterday
 
 
 async def test_process_halfhourly_data_does_not_regress_known_complete_date(
@@ -233,9 +230,10 @@ async def test_process_halfhourly_data_does_not_regress_known_complete_date(
 ) -> None:
     """Regression: no confirmed-complete day must not reset an already-known one."""
     sensor = make_sensor(endpoint="halfhourly")
-    already_known = (datetime.now(NZ_TIMEZONE) - timedelta(days=2)).date()
+    nz_now = datetime.now(NZ_TIMEZONE)
+    already_known = (nz_now - timedelta(days=2)).date()
     sensor._latest_reading_date = already_known
-    payload = [{"timestamp": nz_timestamp(days_ago=0, hour=23, minute=0), "litres": 20}]
+    payload = [{"timestamp": nz_timestamp_on(nz_now.date(), 23, 0), "litres": 20}]
 
     await sensor.process_halfhourly_data(json.dumps(payload))
 
