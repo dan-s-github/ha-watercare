@@ -1157,13 +1157,21 @@ class WatercareUsageSensor(SensorEntity):
         )
         # Same partial-day guard as process_halfhourly_data: a backfill run
         # mid-publish must not write an incomplete trailing hour that the
-        # append-only watermark would then lock in.
-        if latest_complete_date is not None:
-            hourly_consumption = {
-                hour: litres
-                for hour, litres in hourly_consumption.items()
-                if hour.date() <= latest_complete_date
-            }
+        # append-only watermark would then lock in. No complete day at all
+        # (e.g. a brand-new meter whose only history is today's first few
+        # hours) defers the push entirely -- regular polling will write it
+        # once a complete day exists.
+        if latest_complete_date is None:
+            _LOGGER.warning(
+                "Backfill collected no confirmed-complete day; deferring "
+                "statistics push until one appears"
+            )
+            return
+        hourly_consumption = {
+            hour: litres
+            for hour, litres in hourly_consumption.items()
+            if hour.date() <= latest_complete_date
+        }
 
         # Pushing is append-only (see _async_push_hourly_statistic): it only
         # writes hours after the statistic's existing watermark. If regular

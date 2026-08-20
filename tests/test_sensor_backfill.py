@@ -21,19 +21,29 @@ if TYPE_CHECKING:
     from custom_components.watercare.sensor import WatercareUsageSensor
 
 CHUNK_RESPONSE = load_fixture("halfhourly_readings.json")
+# The fixture alone has no 23:30 NZT reading, so no day in it counts as
+# complete and the backfill defers its push. Write-path tests append one
+# (2026-06-15T11:30Z = 23:30 NZST on the fixture's own day) so the whole
+# chunk is a confirmed-complete day.
+COMPLETE_CHUNK_RESPONSE = json.dumps(
+    [
+        *json.loads(CHUNK_RESPONSE),
+        {"timestamp": "2026-06-15T11:30:00.000000Z", "litres": 20},
+    ]
+)
 
 
 async def test_backfill_pages_until_empty_response_then_writes(
     make_sensor: Callable[..., WatercareUsageSensor], patch_recorder: SimpleNamespace
 ) -> None:
     sensor = make_sensor(endpoint="halfhourly")
-    sensor._api.get_data = AsyncMock(side_effect=[CHUNK_RESPONSE, "[]"])
+    sensor._api.get_data = AsyncMock(side_effect=[COMPLETE_CHUNK_RESPONSE, "[]"])
 
     await sensor.async_backfill_halfhourly_history()
 
     assert sensor._api.get_data.await_count == 2
     consumption_points = patch_recorder.written["watercare:halfhourly_consumption"]
-    assert [p["sum"] for p in consumption_points] == [35, 75, 80]
+    assert [p["sum"] for p in consumption_points] == [35, 75, 80, 100]
 
 
 async def test_backfill_aborts_without_writing_on_failed_chunk(
@@ -70,9 +80,9 @@ async def test_backfill_warns_when_existing_watermark_blocks_older_data(
     It must not silently no-op.
     """
     sensor = make_sensor(endpoint="halfhourly")
-    sensor._api.get_data = AsyncMock(side_effect=[CHUNK_RESPONSE, "[]"])
+    sensor._api.get_data = AsyncMock(side_effect=[COMPLETE_CHUNK_RESPONSE, "[]"])
 
-    readings = json.loads(CHUNK_RESPONSE)
+    readings = json.loads(COMPLETE_CHUNK_RESPONSE)
     buckets, _ = sensor._bucket_hourly_readings(readings)
     newest_bucket = max(buckets)
     # All four series already have a watermark newer than everything backfill
@@ -93,6 +103,27 @@ async def test_backfill_warns_when_existing_watermark_blocks_older_data(
 
     assert patch_recorder.written == {}
     assert any("won't be written" in message for message in caplog.messages)
+
+
+async def test_backfill_defers_push_when_no_complete_day_observed(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    patch_recorder: SimpleNamespace,
+) -> None:
+    """
+    Regression: history with no confirmed-complete day must not be pushed.
+
+    A brand-new meter whose only history is a few hours of today has no
+    23:30 NZT reading anywhere; pushing those buckets would lock partial
+    sums in via the append-only watermark. Regular polling pushes once a
+    complete day exists.
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+    sensor._api.get_data = AsyncMock(side_effect=[CHUNK_RESPONSE, "[]"])
+
+    await sensor.async_backfill_halfhourly_history()
+
+    assert patch_recorder.written == {}
+    assert sensor._latest_reading_date is None
 
 
 async def test_backfill_seeds_watermark_and_defers_partial_trailing_day(
