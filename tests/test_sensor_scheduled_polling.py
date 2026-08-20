@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from custom_components.watercare.sensor import WatercareUsageSensor
 
 
-def nz_dt(year: int, month: int, day: int, hour: int) -> datetime:
+def nz_dt(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
     """
     Build a correctly-localized NZ-time datetime.
 
@@ -28,7 +28,7 @@ def nz_dt(year: int, month: int, day: int, hour: int) -> datetime:
     the zone's historical LMT offset instead of the current NZST/NZDT one.
     """
     return NZ_TIMEZONE.localize(
-        datetime(year, month, day, hour, 0, 0)  # noqa: DTZ001 -- localize() below
+        datetime(year, month, day, hour, minute, 0)  # noqa: DTZ001 -- localize() below
     )
 
 
@@ -83,12 +83,24 @@ def test_next_poll_time_skips_immediate_reschedule_at_start_hour_boundary(
     assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 17, 6)
 
 
-def test_next_poll_time_retries_hourly_while_stale(
+def test_next_poll_time_retries_quarter_hourly_during_start_hour_while_stale(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
+    """During POLL_START_HOUR_NZT's own hour, retries are every 15 min."""
     sensor = make_sensor()
     sensor._latest_reading_date = date_type(2026, 8, 14)  # two days stale
     now_nz = nz_dt(2026, 8, 16, 6)
+
+    assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 16, 6, 15)
+
+
+def test_next_poll_time_rolls_from_quarter_hourly_to_hourly_after_start_hour(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    """Once POLL_START_HOUR_NZT's hour is over, retries drop back to hourly."""
+    sensor = make_sensor()
+    sensor._latest_reading_date = date_type(2026, 8, 14)
+    now_nz = nz_dt(2026, 8, 16, 6, 45)
 
     assert sensor._next_poll_time(now_nz) == nz_dt(2026, 8, 16, 7)
 
