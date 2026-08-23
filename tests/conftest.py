@@ -66,6 +66,9 @@ class _FakeRecorderInstance:
     async def async_add_executor_job(self, func: Callable, *args: Any) -> Any:
         return func(*args)
 
+    async def async_block_till_done(self) -> None:
+        return None
+
 
 @pytest.fixture(autouse=True)
 def patch_recorder(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:

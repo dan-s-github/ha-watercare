@@ -97,6 +97,13 @@ HALFHOURLY_BACKFILL_CHUNK_DAYS = 150  # safety margin under the ~161-day cap
 # span every time rather than a short rolling window.
 FULL_HISTORY_LOOKBACK_DAYS = 1095
 
+# Bounds how long a poll/backfill waits for the recorder to confirm it has
+# processed queued statistics writes (see _async_await_recorder_flush) --
+# long enough for a normal queue drain, short enough that a stalled/dead
+# recorder delays one update cycle rather than wedging _update_lock, and
+# therefore every future poll, forever.
+_RECORDER_FLUSH_TIMEOUT = 30
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -675,6 +682,7 @@ class WatercareUsageSensor(SensorEntity):
             unit_class=None,
             empty_warning=None,
         )
+        await self._async_await_recorder_flush()
 
     def _days_in_monthly_reading(self, reading: dict[str, Any]) -> int:
         """Estimate the number of days a monthly reading's litres figure covers."""
@@ -826,6 +834,7 @@ class WatercareUsageSensor(SensorEntity):
             unit_class=None,
             empty_warning=None,
         )
+        await self._async_await_recorder_flush()
 
     @staticmethod
     def _parse_reading_time(timestamp_str: str | None) -> datetime | None:
@@ -910,6 +919,39 @@ class WatercareUsageSensor(SensorEntity):
         if not records:
             return 0.0, None
         return float(records[0].get("sum") or 0.0), records[0]["start"]
+
+    async def _async_await_recorder_flush(self) -> None:
+        """
+        Wait for the recorder to actually persist whatever was just queued.
+
+        push_statistic_series (async_add_external_statistics) only queues
+        the write onto the recorder's background thread and returns
+        immediately -- it does not wait for the write to reach the
+        database. An HA restart landing in that window would silently
+        lose the queued points with no exception raised; for the
+        append-only halfhourly series in particular, no later poll would
+        ever re-fetch and re-write them, since the watermark only ever
+        advances (observed live: restarts during a failed HACS update
+        fragmented several days of halfhourly statistics this way).
+        Callers should call this once after queuing everything for one
+        update cycle, not per series -- the recorder processes its queue
+        FIFO, so one wait after the last queue op covers all of them.
+
+        Bounded by a timeout so a stalled/dead recorder delays this one
+        update cycle rather than blocking _update_lock -- and therefore
+        every future poll -- forever.
+        """
+        try:
+            await asyncio.wait_for(
+                get_instance(self.hass).async_block_till_done(),
+                timeout=_RECORDER_FLUSH_TIMEOUT,
+            )
+        except TimeoutError:
+            _LOGGER.warning(
+                "Recorder did not confirm pending Watercare statistics writes "
+                "within %ss; continuing without confirmation",
+                _RECORDER_FLUSH_TIMEOUT,
+            )
 
     async def _async_push_hourly_statistic(  # noqa: PLR0913 -- one series definition per call keeps push callers declarative; bundling into a dataclass would ripple with no behavior change
         self,
@@ -1006,6 +1048,7 @@ class WatercareUsageSensor(SensorEntity):
             cost_key="wastewater",
             rate_gate=self._wastewater_rate,
         )
+        await self._async_await_recorder_flush()
         return new_count
 
     async def process_halfhourly_data(self, response: str | None) -> None:
@@ -1333,3 +1376,4 @@ class WatercareUsageSensor(SensorEntity):
             unit_class=None,
             empty_warning=None,
         )
+        await self._async_await_recorder_flush()
