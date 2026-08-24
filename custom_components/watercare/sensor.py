@@ -938,13 +938,13 @@ class WatercareUsageSensor(SensorEntity):
         already-stored hours are {hour_start: sum} for hours at/after
         `since` that _async_heal_hourly_points needs to rebuild the window.
 
-        `_HEAL_LOOKBACK_STATS` hours is comfortably more than the halfhourly
-        endpoint's 7-day fetch window even if most of those hours are
-        sparse/missing (the exact scenario this is healing), so the anchor
-        before `since` is always found in this one query. If it isn't --
-        `since` is further back than the lookback reaches -- there's no
-        stored data yet to anchor to, so anchor_sum defaults to 0.0, same as
-        a brand-new statistic.
+        `_HEAL_LOOKBACK_STATS` rows is comfortably more than the halfhourly
+        endpoint's 7-day (168-hour) fetch window even if most of those hours
+        are sparse/missing (the exact scenario this is healing), so the
+        anchor before `since` is always found among the rows this one query
+        returns. If it isn't -- `since` is further back than the lookback
+        reaches -- there's no stored data yet to anchor to, so anchor_sum
+        defaults to 0.0, same as a brand-new statistic.
         """
         last_stat = await get_instance(self.hass).async_add_executor_job(
             get_last_statistics,
@@ -997,13 +997,21 @@ class WatercareUsageSensor(SensorEntity):
         next time the API returns more for that hour, with no risk of
         clobbering an hour this poll didn't see: those keep their already-
         stored sum via `existing_sums`, they're just not re-sent.
+
+        Any `hourly_consumption` hour before `heal_since` is ignored -- it's
+        outside the window `anchor_sum` accounts for, so folding it into the
+        running sum would double-count it against whatever's already stored
+        there.
         """
         anchor_sum, existing_sums = await self._async_statistics_window(
             statistic_id, heal_since
         )
+        healed_hours = {
+            hour for hour in hourly_consumption if hour >= heal_since
+        } | set(existing_sums)
         running_sum = anchor_sum
         points = []
-        for hour_start in sorted(set(hourly_consumption) | set(existing_sums)):
+        for hour_start in sorted(healed_hours):
             if hour_start in hourly_consumption:
                 litres = hourly_consumption[hour_start]
                 if cost_key is None:

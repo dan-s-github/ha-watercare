@@ -214,6 +214,44 @@ async def test_push_hourly_statistic_heal_since_preserves_hours_missing_from_thi
     assert points[0]["sum"] == 1004  # carried forward from hour_12's stored 999, + 5
 
 
+async def test_push_hourly_statistic_heal_since_ignores_hours_before_window(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    patch_recorder: SimpleNamespace,
+) -> None:
+    """
+    Regression: an hourly_consumption entry before heal_since is ignored.
+
+    anchor_sum already accounts for everything up to just before
+    heal_since, so folding an earlier hour into the running sum too would
+    double-count it.
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+    nz_now = datetime.now(NZ_TIMEZONE)
+    hour_11 = nz_now.replace(hour=11, minute=0, second=0, microsecond=0)
+    hour_12 = hour_11 + timedelta(hours=1)
+    patch_recorder.stored_statistics["watercare:halfhourly_consumption"] = [
+        (10.0, hour_11.timestamp()),  # anchor already includes hour_11's litres
+    ]
+    # This poll's response still (redundantly) includes hour_11 alongside
+    # the new hour_12 -- hour_11 must not be re-added on top of the anchor.
+    buckets = {hour_11: 10, hour_12: 5}
+
+    new_count = await sensor._async_push_hourly_statistic(
+        buckets,
+        statistic_id="watercare:halfhourly_consumption",
+        name="Watercare Half-hourly Consumption",
+        unit="L",
+        cost_key=None,
+        rate_gate=None,
+        heal_since=hour_12,
+    )
+
+    assert new_count == 1  # hour_11 excluded, only hour_12 written
+    points = patch_recorder.written["watercare:halfhourly_consumption"]
+    assert points[0]["start"] == hour_12
+    assert points[0]["sum"] == 15  # 10 (anchor) + 5, not 10 + 10 + 5
+
+
 async def test_push_hourly_statistic_zero_rate_gate_skips_entirely(
     make_sensor: Callable[..., WatercareUsageSensor],
     readings: list[dict],
