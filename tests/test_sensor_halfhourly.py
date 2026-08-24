@@ -131,6 +131,89 @@ async def test_push_hourly_statistic_nothing_new_writes_nothing(
     assert "watercare:halfhourly_consumption" not in patch_recorder.written
 
 
+async def test_push_hourly_statistic_heal_since_backfills_gap(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    patch_recorder: SimpleNamespace,
+) -> None:
+    """
+    Regression: heal a gap a sparser earlier poll's response skipped.
+
+    A fuller poll must correct any already-stored later hour too.
+    Reproduces the live bug: Watercare's API returned a sparse set of
+    half-hourly readings for a day that still included the 23:30 reading,
+    so the day was (correctly) marked complete and pushed -- but with a
+    gap at hour 12:00 the response was missing. The append-only watermark
+    then permanently blocked hour 12:00 from ever being written, even once
+    a later poll's response included it, because hour 14:00 (after the
+    gap) had already advanced the watermark past it.
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+    nz_now = datetime.now(NZ_TIMEZONE)
+    hour_12 = nz_now.replace(hour=12, minute=0, second=0, microsecond=0)
+    hour_14 = hour_12 + timedelta(hours=2)
+    # Simulates the earlier sparse poll: it only ever saw hour 14:00.
+    patch_recorder.stored_statistics["watercare:halfhourly_consumption"] = [
+        (4.0, hour_14.timestamp()),
+    ]
+    # This poll's fuller response fills the gap at hour 12:00.
+    buckets = {hour_12: 23, hour_14: 4}
+
+    new_count = await sensor._async_push_hourly_statistic(
+        buckets,
+        statistic_id="watercare:halfhourly_consumption",
+        name="Watercare Half-hourly Consumption",
+        unit="L",
+        cost_key=None,
+        rate_gate=None,
+        heal_since=hour_12,
+    )
+
+    assert new_count == 2
+    points = {
+        p["start"]: p["sum"]
+        for p in patch_recorder.written["watercare:halfhourly_consumption"]
+    }
+    assert points[hour_12] == 23
+    assert points[hour_14] == 27  # healed: 23 + 4, not the stale 4
+
+
+async def test_push_hourly_statistic_heal_since_preserves_hours_missing_from_this_poll(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    patch_recorder: SimpleNamespace,
+) -> None:
+    """
+    Regression: healing must leave an hour missing from this poll alone.
+
+    Its stored sum must still be carried forward as a checkpoint for later
+    hours' running totals rather than being dropped.
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+    nz_now = datetime.now(NZ_TIMEZONE)
+    hour_11 = nz_now.replace(hour=11, minute=0, second=0, microsecond=0)
+    hour_12 = hour_11 + timedelta(hours=1)
+    hour_13 = hour_11 + timedelta(hours=2)
+    patch_recorder.stored_statistics["watercare:halfhourly_consumption"] = [
+        (10.0, hour_11.timestamp()),  # anchor: before the healing window
+        (999.0, hour_12.timestamp()),  # already stored, absent from this poll
+    ]
+    buckets = {hour_13: 5}  # this poll only returned hour 13:00
+
+    new_count = await sensor._async_push_hourly_statistic(
+        buckets,
+        statistic_id="watercare:halfhourly_consumption",
+        name="Watercare Half-hourly Consumption",
+        unit="L",
+        cost_key=None,
+        rate_gate=None,
+        heal_since=hour_12,
+    )
+
+    assert new_count == 1  # hour_12 untouched, not re-sent
+    points = patch_recorder.written["watercare:halfhourly_consumption"]
+    assert points[0]["start"] == hour_13
+    assert points[0]["sum"] == 1004  # carried forward from hour_12's stored 999, + 5
+
+
 async def test_push_hourly_statistic_zero_rate_gate_skips_entirely(
     make_sensor: Callable[..., WatercareUsageSensor],
     readings: list[dict],
