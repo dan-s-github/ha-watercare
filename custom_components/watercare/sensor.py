@@ -1002,6 +1002,11 @@ class WatercareUsageSensor(SensorEntity):
         outside the window `anchor_sum` accounts for, so folding it into the
         running sum would double-count it against whatever's already stored
         there.
+
+        A recomputed hour whose sum comes out identical to what's already
+        stored is left out of the returned points -- healing re-touches the
+        whole window every poll, so without this most hours would upsert an
+        unchanged value every single time.
         """
         anchor_sum, existing_sums = await self._async_statistics_window(
             statistic_id, heal_since
@@ -1018,7 +1023,8 @@ class WatercareUsageSensor(SensorEntity):
                     running_sum += litres
                 else:
                     running_sum += self._calculate_cost(litres, 1 / 24)[cost_key]
-                points.append(StatisticData(start=hour_start, sum=running_sum))
+                if existing_sums.get(hour_start) != running_sum:
+                    points.append(StatisticData(start=hour_start, sum=running_sum))
             else:
                 # Not in this poll's readings -- carry its already-stored
                 # sum forward so later healed hours' running totals stay

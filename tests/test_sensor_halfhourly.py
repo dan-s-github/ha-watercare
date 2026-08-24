@@ -252,6 +252,43 @@ async def test_push_hourly_statistic_heal_since_ignores_hours_before_window(
     assert points[0]["sum"] == 15  # 10 (anchor) + 5, not 10 + 10 + 5
 
 
+async def test_push_hourly_statistic_heal_since_skips_unchanged_recomputed_hours(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    patch_recorder: SimpleNamespace,
+) -> None:
+    """
+    Regression: healing must not re-upsert an unchanged recomputed hour.
+
+    Healing re-touches the whole window every poll, so without this,
+    every already-correct hour in the window would get rewritten with an
+    unchanged value on every single poll.
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+    nz_now = datetime.now(NZ_TIMEZONE)
+    hour_12 = nz_now.replace(hour=12, minute=0, second=0, microsecond=0)
+    hour_13 = hour_12 + timedelta(hours=1)
+    patch_recorder.stored_statistics["watercare:halfhourly_consumption"] = [
+        (23.0, hour_12.timestamp()),
+    ]
+    # This poll re-fetches hour_12 (unchanged) and adds new hour_13.
+    buckets = {hour_12: 23, hour_13: 5}
+
+    new_count = await sensor._async_push_hourly_statistic(
+        buckets,
+        statistic_id="watercare:halfhourly_consumption",
+        name="Watercare Half-hourly Consumption",
+        unit="L",
+        cost_key=None,
+        rate_gate=None,
+        heal_since=hour_12,
+    )
+
+    assert new_count == 1  # hour_12 skipped, only the genuinely new hour_13
+    points = patch_recorder.written["watercare:halfhourly_consumption"]
+    assert points[0]["start"] == hour_13
+    assert points[0]["sum"] == 28
+
+
 async def test_push_hourly_statistic_zero_rate_gate_skips_entirely(
     make_sensor: Callable[..., WatercareUsageSensor],
     readings: list[dict],
