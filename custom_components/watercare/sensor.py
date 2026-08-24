@@ -6,6 +6,7 @@ import asyncio
 import calendar
 import json
 import logging
+import math
 from datetime import UTC, datetime, timedelta
 from datetime import date as date_type
 from typing import TYPE_CHECKING, Any
@@ -103,6 +104,14 @@ FULL_HISTORY_LOOKBACK_DAYS = 1095
 # recorder delays one update cycle rather than wedging _update_lock, and
 # therefore every future poll, forever.
 _RECORDER_FLUSH_TIMEOUT = 30
+
+# How many of the most recent hourly statistics to fetch in one query when
+# looking for the anchor sum just before a healing window starts (see
+# _async_statistics_window). Comfortably more than the halfhourly endpoint's
+# 7-day (168-hour) regular-poll fetch window, even accounting for the window
+# itself being sparse -- the exact gap this healing is fixing -- so the
+# anchor is reliably found in a single query.
+_HEAL_LOOKBACK_STATS = 24 * 10
 
 
 async def async_setup_entry(
@@ -920,6 +929,118 @@ class WatercareUsageSensor(SensorEntity):
             return 0.0, None
         return float(records[0].get("sum") or 0.0), records[0]["start"]
 
+    async def _async_statistics_window(
+        self, statistic_id: str, since: datetime
+    ) -> tuple[float, dict[datetime, float]]:
+        """
+        Return the (anchor sum, already-stored hours) inputs a healing window needs.
+
+        The anchor sum is the cumulative sum just before `since`; the
+        already-stored hours are {hour_start: sum} for hours at/after
+        `since` that _async_heal_hourly_points needs to rebuild the window.
+
+        `_HEAL_LOOKBACK_STATS` rows is comfortably more than the halfhourly
+        endpoint's 7-day (168-hour) fetch window even if most of those hours
+        are sparse/missing (the exact scenario this is healing), so the
+        anchor before `since` is always found among the rows this one query
+        returns. If it isn't -- `since` is further back than the lookback
+        reaches -- there's no stored data yet to anchor to, so anchor_sum
+        defaults to 0.0, same as a brand-new statistic.
+        """
+        last_stat = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics,
+            self.hass,
+            _HEAL_LOOKBACK_STATS,
+            statistic_id,
+            True,  # noqa: FBT003 -- positional per get_last_statistics' signature
+            {"sum"},
+        )
+        since_ts = since.timestamp()
+        anchor_sum = 0.0
+        existing_sums: dict[datetime, float] = {}
+        # Rows come back newest-first (see get_last_statistics), so the
+        # first one older than `since` is the closest anchor.
+        for row in last_stat.get(statistic_id, []):
+            start_ts = row["start"]
+            if start_ts >= since_ts:
+                existing_sums[datetime.fromtimestamp(start_ts, tz=NZ_TIMEZONE)] = float(
+                    row.get("sum") or 0.0
+                )
+            else:
+                anchor_sum = float(row.get("sum") or 0.0)
+                break
+        return anchor_sum, existing_sums
+
+    async def _async_heal_hourly_points(
+        self,
+        hourly_consumption: dict[datetime, float],
+        *,
+        statistic_id: str,
+        heal_since: datetime,
+        cost_key: str | None,
+    ) -> list[StatisticData]:
+        """
+        Rebuild every hour from `heal_since` onward.
+
+        Mixes this poll's fresh readings with whatever's already stored for
+        hours this poll didn't return. Fixes a gap class the plain
+        append-only push (see
+        _async_push_hourly_statistic) can't: Watercare's API has been
+        observed to return a sparse set of half-hourly readings for a day
+        that still includes the 23:30 reading, so _bucket_hourly_readings
+        correctly calls the day complete, but the resulting push is missing
+        whichever hours weren't in that response -- and since the watermark
+        only advances, a later poll with a fuller response for the same day
+        could never fill them in. Recomputing the whole window from an
+        anchor before it and upserting (async_add_external_statistics
+        updates an existing point for a given start rather than duplicating
+        it) means a hole from one poll's sparse response gets healed the
+        next time the API returns more for that hour, with no risk of
+        clobbering an hour this poll didn't see: those keep their already-
+        stored sum via `existing_sums`, they're just not re-sent.
+
+        Any `hourly_consumption` hour before `heal_since` is ignored -- it's
+        outside the window `anchor_sum` accounts for, so folding it into the
+        running sum would double-count it against whatever's already stored
+        there.
+
+        A recomputed hour whose sum comes out unchanged from what's already
+        stored (within floating-point tolerance -- cost series in
+        particular can re-derive a value a rounding ULP off from the
+        original even when nothing actually changed) is left out of the
+        returned points -- healing re-touches the whole window every poll,
+        so without this most hours would upsert a functionally-unchanged
+        value every single time.
+        """
+        anchor_sum, existing_sums = await self._async_statistics_window(
+            statistic_id, heal_since
+        )
+        healed_hours = {
+            hour for hour in hourly_consumption if hour >= heal_since
+        } | set(existing_sums)
+        running_sum = anchor_sum
+        points = []
+        for hour_start in sorted(healed_hours):
+            if hour_start in hourly_consumption:
+                litres = hourly_consumption[hour_start]
+                if cost_key is None:
+                    running_sum += litres
+                else:
+                    running_sum += self._calculate_cost(litres, 1 / 24)[cost_key]
+                if not math.isclose(
+                    existing_sums.get(hour_start, math.nan),
+                    running_sum,
+                    rel_tol=1e-9,
+                    abs_tol=1e-9,
+                ):
+                    points.append(StatisticData(start=hour_start, sum=running_sum))
+            else:
+                # Not in this poll's readings -- carry its already-stored
+                # sum forward so later healed hours' running totals stay
+                # correct, without re-sending a point for it.
+                running_sum = existing_sums[hour_start]
+        return points
+
     async def _async_await_recorder_flush(self) -> None:
         """
         Wait for the recorder to actually persist whatever was just queued.
@@ -963,36 +1084,53 @@ class WatercareUsageSensor(SensorEntity):
         cost_key: str | None,
         rate_gate: float | None,
         unit_class: str | None = None,
+        heal_since: datetime | None = None,
     ) -> int:
         """
-        Push one incremental hourly external-statistics series.
+        Push one hourly external-statistics series.
 
         Continues from whatever cumulative sum is already stored for
-        `statistic_id` rather than resetting to zero, and only appends
-        hours after the last stored one -- so repeated polls and a one-off
-        deep backfill can safely share the same statistic history without
-        the running total jumping backwards.
+        `statistic_id` rather than resetting to zero.
 
-        Returns the number of new points actually written -- callers that
+        With `heal_since` unset (the deep one-off backfill's usage -- see
+        async_backfill_halfhourly_history), only appends hours strictly
+        after the last stored one, append-only, so a run over years of
+        history doesn't requery/resend all of it every time.
+
+        With `heal_since` set (the regular poll's usage -- see
+        process_halfhourly_data), rebuilds every hour from `heal_since`
+        onward instead (see _async_heal_hourly_points): the regular poll's
+        fetch window is only ~7 days, cheap to fully requery, and doing so
+        heals any gap a previous poll's sparse API response left behind.
+
+        Returns the number of points actually written -- callers that
         expect to backfill older history should check this, since it will
         be 0 if `hourly_consumption` is entirely at or before the existing
-        watermark.
+        watermark (heal_since unset) or contributes nothing new (heal_since
+        set).
         """
         if rate_gate is not None and rate_gate <= 0:
             return 0
 
-        running_sum, last_start = await self._async_last_statistic_sum(statistic_id)
-
-        new_points = []
-        for hour_start in sorted(hourly_consumption):
-            if last_start is not None and hour_start.timestamp() <= last_start:
-                continue
-            litres = hourly_consumption[hour_start]
-            if cost_key is None:
-                running_sum += litres
-            else:
-                running_sum += self._calculate_cost(litres, 1 / 24)[cost_key]
-            new_points.append(StatisticData(start=hour_start, sum=running_sum))
+        if heal_since is not None:
+            new_points = await self._async_heal_hourly_points(
+                hourly_consumption,
+                statistic_id=statistic_id,
+                heal_since=heal_since,
+                cost_key=cost_key,
+            )
+        else:
+            running_sum, last_start = await self._async_last_statistic_sum(statistic_id)
+            new_points = []
+            for hour_start in sorted(hourly_consumption):
+                if last_start is not None and hour_start.timestamp() <= last_start:
+                    continue
+                litres = hourly_consumption[hour_start]
+                if cost_key is None:
+                    running_sum += litres
+                else:
+                    running_sum += self._calculate_cost(litres, 1 / 24)[cost_key]
+                new_points.append(StatisticData(start=hour_start, sum=running_sum))
 
         push_statistic_series(
             self.hass,
@@ -1006,10 +1144,15 @@ class WatercareUsageSensor(SensorEntity):
         return len(new_points)
 
     async def _async_push_halfhourly_statistics(
-        self, hourly_consumption: dict[datetime, float]
+        self,
+        hourly_consumption: dict[datetime, float],
+        *,
+        heal_since: datetime | None = None,
     ) -> int:
         """
         Push all four hourly statistic series for the halfhourly endpoint.
+
+        See _async_push_hourly_statistic for what `heal_since` changes.
 
         Returns the number of new consumption points written (the other
         three series share the same watermark and will match, unless
@@ -1023,6 +1166,7 @@ class WatercareUsageSensor(SensorEntity):
             cost_key=None,
             rate_gate=None,
             unit_class=VolumeConverter.UNIT_CLASS,
+            heal_since=heal_since,
         )
         await self._async_push_hourly_statistic(
             hourly_consumption,
@@ -1031,6 +1175,7 @@ class WatercareUsageSensor(SensorEntity):
             unit="NZD",
             cost_key="total",
             rate_gate=None,
+            heal_since=heal_since,
         )
         await self._async_push_hourly_statistic(
             hourly_consumption,
@@ -1039,6 +1184,7 @@ class WatercareUsageSensor(SensorEntity):
             unit="NZD",
             cost_key="consumption",
             rate_gate=self._consumption_rate,
+            heal_since=heal_since,
         )
         await self._async_push_hourly_statistic(
             hourly_consumption,
@@ -1047,6 +1193,7 @@ class WatercareUsageSensor(SensorEntity):
             unit="NZD",
             cost_key="wastewater",
             rate_gate=self._wastewater_rate,
+            heal_since=heal_since,
         )
         await self._async_await_recorder_flush()
         return new_count
@@ -1115,7 +1262,15 @@ class WatercareUsageSensor(SensorEntity):
             for hour, litres in hourly_consumption.items()
             if hour.date() <= latest_complete_date
         }
-        await self._async_push_halfhourly_statistics(complete_day_buckets)
+        # Heal the whole fetched window, not just append past the
+        # watermark: Watercare's API has been observed to return a sparse
+        # set of readings for a day that still includes the 23:30 reading,
+        # so a later, fuller response for the same day needs to be able to
+        # fill in what an earlier poll's push missed (see
+        # _async_heal_hourly_points).
+        await self._async_push_halfhourly_statistics(
+            complete_day_buckets, heal_since=min(complete_day_buckets)
+        )
 
         # Advance the freshness watermark only now that the push has
         # succeeded -- a failed push must leave the day stale so the retry

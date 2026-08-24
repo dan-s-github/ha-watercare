@@ -131,6 +131,200 @@ async def test_push_hourly_statistic_nothing_new_writes_nothing(
     assert "watercare:halfhourly_consumption" not in patch_recorder.written
 
 
+async def test_push_hourly_statistic_heal_since_backfills_gap(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    patch_recorder: SimpleNamespace,
+) -> None:
+    """
+    Regression: heal a gap a sparser earlier poll's response skipped.
+
+    A fuller poll must correct any already-stored later hour too.
+    Reproduces the live bug: Watercare's API returned a sparse set of
+    half-hourly readings for a day that still included the 23:30 reading,
+    so the day was (correctly) marked complete and pushed -- but with a
+    gap at hour 12:00 the response was missing. The append-only watermark
+    then permanently blocked hour 12:00 from ever being written, even once
+    a later poll's response included it, because hour 14:00 (after the
+    gap) had already advanced the watermark past it.
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+    nz_now = datetime.now(NZ_TIMEZONE)
+    hour_12 = nz_now.replace(hour=12, minute=0, second=0, microsecond=0)
+    hour_14 = hour_12 + timedelta(hours=2)
+    # Simulates the earlier sparse poll: it only ever saw hour 14:00.
+    patch_recorder.stored_statistics["watercare:halfhourly_consumption"] = [
+        (4.0, hour_14.timestamp()),
+    ]
+    # This poll's fuller response fills the gap at hour 12:00.
+    buckets = {hour_12: 23, hour_14: 4}
+
+    new_count = await sensor._async_push_hourly_statistic(
+        buckets,
+        statistic_id="watercare:halfhourly_consumption",
+        name="Watercare Half-hourly Consumption",
+        unit="L",
+        cost_key=None,
+        rate_gate=None,
+        heal_since=hour_12,
+    )
+
+    assert new_count == 2
+    points = {
+        p["start"]: p["sum"]
+        for p in patch_recorder.written["watercare:halfhourly_consumption"]
+    }
+    assert points[hour_12] == 23
+    assert points[hour_14] == 27  # healed: 23 + 4, not the stale 4
+
+
+async def test_push_hourly_statistic_heal_since_preserves_hours_missing_from_this_poll(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    patch_recorder: SimpleNamespace,
+) -> None:
+    """
+    Regression: healing must leave an hour missing from this poll alone.
+
+    Its stored sum must still be carried forward as a checkpoint for later
+    hours' running totals rather than being dropped.
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+    nz_now = datetime.now(NZ_TIMEZONE)
+    hour_11 = nz_now.replace(hour=11, minute=0, second=0, microsecond=0)
+    hour_12 = hour_11 + timedelta(hours=1)
+    hour_13 = hour_11 + timedelta(hours=2)
+    patch_recorder.stored_statistics["watercare:halfhourly_consumption"] = [
+        (10.0, hour_11.timestamp()),  # anchor: before the healing window
+        (999.0, hour_12.timestamp()),  # already stored, absent from this poll
+    ]
+    buckets = {hour_13: 5}  # this poll only returned hour 13:00
+
+    new_count = await sensor._async_push_hourly_statistic(
+        buckets,
+        statistic_id="watercare:halfhourly_consumption",
+        name="Watercare Half-hourly Consumption",
+        unit="L",
+        cost_key=None,
+        rate_gate=None,
+        heal_since=hour_12,
+    )
+
+    assert new_count == 1  # hour_12 untouched, not re-sent
+    points = patch_recorder.written["watercare:halfhourly_consumption"]
+    assert points[0]["start"] == hour_13
+    assert points[0]["sum"] == 1004  # carried forward from hour_12's stored 999, + 5
+
+
+async def test_push_hourly_statistic_heal_since_ignores_hours_before_window(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    patch_recorder: SimpleNamespace,
+) -> None:
+    """
+    Regression: an hourly_consumption entry before heal_since is ignored.
+
+    anchor_sum already accounts for everything up to just before
+    heal_since, so folding an earlier hour into the running sum too would
+    double-count it.
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+    nz_now = datetime.now(NZ_TIMEZONE)
+    hour_11 = nz_now.replace(hour=11, minute=0, second=0, microsecond=0)
+    hour_12 = hour_11 + timedelta(hours=1)
+    patch_recorder.stored_statistics["watercare:halfhourly_consumption"] = [
+        (10.0, hour_11.timestamp()),  # anchor already includes hour_11's litres
+    ]
+    # This poll's response still (redundantly) includes hour_11 alongside
+    # the new hour_12 -- hour_11 must not be re-added on top of the anchor.
+    buckets = {hour_11: 10, hour_12: 5}
+
+    new_count = await sensor._async_push_hourly_statistic(
+        buckets,
+        statistic_id="watercare:halfhourly_consumption",
+        name="Watercare Half-hourly Consumption",
+        unit="L",
+        cost_key=None,
+        rate_gate=None,
+        heal_since=hour_12,
+    )
+
+    assert new_count == 1  # hour_11 excluded, only hour_12 written
+    points = patch_recorder.written["watercare:halfhourly_consumption"]
+    assert points[0]["start"] == hour_12
+    assert points[0]["sum"] == 15  # 10 (anchor) + 5, not 10 + 10 + 5
+
+
+async def test_push_hourly_statistic_heal_since_skips_unchanged_recomputed_hours(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    patch_recorder: SimpleNamespace,
+) -> None:
+    """
+    Regression: healing must not re-upsert an unchanged recomputed hour.
+
+    Healing re-touches the whole window every poll, so without this,
+    every already-correct hour in the window would get rewritten with an
+    unchanged value on every single poll.
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+    nz_now = datetime.now(NZ_TIMEZONE)
+    hour_12 = nz_now.replace(hour=12, minute=0, second=0, microsecond=0)
+    hour_13 = hour_12 + timedelta(hours=1)
+    patch_recorder.stored_statistics["watercare:halfhourly_consumption"] = [
+        (23.0, hour_12.timestamp()),
+    ]
+    # This poll re-fetches hour_12 (unchanged) and adds new hour_13.
+    buckets = {hour_12: 23, hour_13: 5}
+
+    new_count = await sensor._async_push_hourly_statistic(
+        buckets,
+        statistic_id="watercare:halfhourly_consumption",
+        name="Watercare Half-hourly Consumption",
+        unit="L",
+        cost_key=None,
+        rate_gate=None,
+        heal_since=hour_12,
+    )
+
+    assert new_count == 1  # hour_12 skipped, only the genuinely new hour_13
+    points = patch_recorder.written["watercare:halfhourly_consumption"]
+    assert points[0]["start"] == hour_13
+    assert points[0]["sum"] == 28
+
+
+async def test_push_hourly_statistic_heal_since_unchanged_skip_tolerates_float_roundoff(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    patch_recorder: SimpleNamespace,
+) -> None:
+    """
+    Regression: the unchanged-hour skip must use a float tolerance.
+
+    A cost series recomputation can land a rounding ULP off the originally
+    stored value even when nothing actually changed (division/multiplication
+    aren't exact in floating point) -- exact equality would treat that as a
+    real change and re-upsert it every poll, defeating the optimization for
+    exactly the series it matters most for.
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+    nz_now = datetime.now(NZ_TIMEZONE)
+    hour_12 = nz_now.replace(hour=12, minute=0, second=0, microsecond=0)
+    stored_sum = 23.000000000000004  # a plausible one-ULP-off stored value
+    patch_recorder.stored_statistics["watercare:halfhourly_consumption"] = [
+        (stored_sum, hour_12.timestamp()),
+    ]
+    buckets = {hour_12: 23}  # recomputes to exactly 23.0, not stored_sum
+
+    new_count = await sensor._async_push_hourly_statistic(
+        buckets,
+        statistic_id="watercare:halfhourly_consumption",
+        name="Watercare Half-hourly Consumption",
+        unit="L",
+        cost_key=None,
+        rate_gate=None,
+        heal_since=hour_12,
+    )
+
+    assert new_count == 0
+    assert "watercare:halfhourly_consumption" not in patch_recorder.written
+
+
 async def test_push_hourly_statistic_zero_rate_gate_skips_entirely(
     make_sensor: Callable[..., WatercareUsageSensor],
     readings: list[dict],

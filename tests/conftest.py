@@ -76,20 +76,36 @@ def patch_recorder(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     Replace recorder/statistics calls with in-memory fakes.
 
     Exposes `.written` (statistic_id -> list of StatisticData actually
-    pushed via async_add_external_statistics) and `.last_statistics`
-    (statistic_id -> (sum, start_ts), settable per-test to simulate an
-    existing watermark before calling the code under test).
+    pushed via async_add_external_statistics), `.last_statistics`
+    (statistic_id -> (sum, start_ts), settable per-test to simulate a single
+    existing watermark record), and `.stored_statistics` (statistic_id ->
+    list of (sum, start_ts), for tests simulating several already-stored
+    hours -- e.g. the healing window's anchor plus in-window hours. Takes
+    priority over `.last_statistics` when both are set for the same
+    statistic_id.
     """
     written: dict[str, list] = {}
     last_statistics: dict[str, tuple[float, float]] = {}
+    stored_statistics: dict[str, list[tuple[float, float]]] = {}
 
     def fake_get_last_statistics(
         _hass: Any,
-        _number: int,
+        number: int,
         statistic_id: str,
         _convert_units: bool,  # noqa: FBT001
         _types: set[str],
     ) -> dict[str, list[dict[str, Any]]]:
+        if statistic_id in stored_statistics:
+            # Real get_last_statistics returns newest-first.
+            records = sorted(
+                stored_statistics[statistic_id], key=lambda r: r[1], reverse=True
+            )
+            return {
+                statistic_id: [
+                    {"sum": total, "start": start_ts}
+                    for total, start_ts in records[:number]
+                ]
+            }
         if statistic_id not in last_statistics:
             return {}
         total, start_ts = last_statistics[statistic_id]
@@ -116,7 +132,11 @@ def patch_recorder(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         watercare_sensor, "get_instance", lambda _hass: _FakeRecorderInstance()
     )
 
-    return SimpleNamespace(written=written, last_statistics=last_statistics)
+    return SimpleNamespace(
+        written=written,
+        last_statistics=last_statistics,
+        stored_statistics=stored_statistics,
+    )
 
 
 @pytest.fixture
