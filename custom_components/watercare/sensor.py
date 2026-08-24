@@ -6,6 +6,7 @@ import asyncio
 import calendar
 import json
 import logging
+import math
 from datetime import UTC, datetime, timedelta
 from datetime import date as date_type
 from typing import TYPE_CHECKING, Any
@@ -1003,10 +1004,13 @@ class WatercareUsageSensor(SensorEntity):
         running sum would double-count it against whatever's already stored
         there.
 
-        A recomputed hour whose sum comes out identical to what's already
-        stored is left out of the returned points -- healing re-touches the
-        whole window every poll, so without this most hours would upsert an
-        unchanged value every single time.
+        A recomputed hour whose sum comes out unchanged from what's already
+        stored (within floating-point tolerance -- cost series in
+        particular can re-derive a value a rounding ULP off from the
+        original even when nothing actually changed) is left out of the
+        returned points -- healing re-touches the whole window every poll,
+        so without this most hours would upsert a functionally-unchanged
+        value every single time.
         """
         anchor_sum, existing_sums = await self._async_statistics_window(
             statistic_id, heal_since
@@ -1023,7 +1027,12 @@ class WatercareUsageSensor(SensorEntity):
                     running_sum += litres
                 else:
                     running_sum += self._calculate_cost(litres, 1 / 24)[cost_key]
-                if existing_sums.get(hour_start) != running_sum:
+                if not math.isclose(
+                    existing_sums.get(hour_start, math.nan),
+                    running_sum,
+                    rel_tol=1e-9,
+                    abs_tol=1e-9,
+                ):
                     points.append(StatisticData(start=hour_start, sum=running_sum))
             else:
                 # Not in this poll's readings -- carry its already-stored

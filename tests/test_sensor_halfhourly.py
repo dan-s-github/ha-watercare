@@ -289,6 +289,42 @@ async def test_push_hourly_statistic_heal_since_skips_unchanged_recomputed_hours
     assert points[0]["sum"] == 28
 
 
+async def test_push_hourly_statistic_heal_since_unchanged_skip_tolerates_float_roundoff(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    patch_recorder: SimpleNamespace,
+) -> None:
+    """
+    Regression: the unchanged-hour skip must use a float tolerance.
+
+    A cost series recomputation can land a rounding ULP off the originally
+    stored value even when nothing actually changed (division/multiplication
+    aren't exact in floating point) -- exact equality would treat that as a
+    real change and re-upsert it every poll, defeating the optimization for
+    exactly the series it matters most for.
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+    nz_now = datetime.now(NZ_TIMEZONE)
+    hour_12 = nz_now.replace(hour=12, minute=0, second=0, microsecond=0)
+    stored_sum = 23.000000000000004  # a plausible one-ULP-off stored value
+    patch_recorder.stored_statistics["watercare:halfhourly_consumption"] = [
+        (stored_sum, hour_12.timestamp()),
+    ]
+    buckets = {hour_12: 23}  # recomputes to exactly 23.0, not stored_sum
+
+    new_count = await sensor._async_push_hourly_statistic(
+        buckets,
+        statistic_id="watercare:halfhourly_consumption",
+        name="Watercare Half-hourly Consumption",
+        unit="L",
+        cost_key=None,
+        rate_gate=None,
+        heal_since=hour_12,
+    )
+
+    assert new_count == 0
+    assert "watercare:halfhourly_consumption" not in patch_recorder.written
+
+
 async def test_push_hourly_statistic_zero_rate_gate_skips_entirely(
     make_sensor: Callable[..., WatercareUsageSensor],
     readings: list[dict],
