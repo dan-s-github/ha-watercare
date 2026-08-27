@@ -222,6 +222,11 @@ class WatercareUsageSensor(SensorEntity):
         self._entry = entry
         self._needs_backfill = needs_backfill
         self._unsub_scheduled_poll = None
+        # Guards _get_data(): the retry ladder can call it many times a day
+        # while credentials are actually broken, and async_start_reauth()
+        # itself dedupes concurrent flows but not the log spam -- only warn
+        # and start a flow once per outage, clearing on the next success.
+        self._reauth_started = False
         # Serializes regular updates and deep backfills: a scheduled poll
         # landing mid-backfill would otherwise advance the append-only
         # statistics watermark past the backfill's older history, silently
@@ -499,15 +504,24 @@ class WatercareUsageSensor(SensorEntity):
         A rejected password/refresh token isn't a transient failure the
         normal retry ladder can recover from -- surface it the standard HA
         way (a reauth prompt in Settings) instead of just logging forever.
+        Only the first rejection during an outage warns/starts a flow (see
+        _reauth_started); the retry ladder can otherwise call this many
+        times a day and spam the log for the entire outage.
         """
         try:
-            return await self._api.get_data(
+            response = await self._api.get_data(
                 endpoint=endpoint, start_date=start_date, end_date=end_date
             )
-        except WatercareAuthError:
-            _LOGGER.warning("Watercare credentials rejected; starting reauth flow")
-            self._entry.async_start_reauth(self.hass)
+        except WatercareAuthError as err:
+            if not self._reauth_started:
+                self._reauth_started = True
+                _LOGGER.warning(
+                    "Watercare credentials rejected; starting reauth flow: %s", err
+                )
+                self._entry.async_start_reauth(self.hass)
             return None
+        self._reauth_started = False
+        return response
 
     async def async_update(self) -> None:
         """Update the sensor data."""

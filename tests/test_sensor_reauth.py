@@ -39,3 +39,34 @@ async def test_get_data_passes_through_response_without_starting_reauth(
 
     assert result == "usage-data"
     sensor._entry.async_start_reauth.assert_not_called()
+
+
+async def test_get_data_only_starts_reauth_once_per_outage(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    """Regression: the retry ladder can call _get_data many times a day."""
+    sensor = make_sensor()
+    sensor._api.get_data = AsyncMock(side_effect=WatercareAuthError("bad creds"))
+
+    await sensor._get_data(endpoint="halfhourly", start_date=None, end_date=None)
+    await sensor._get_data(endpoint="halfhourly", start_date=None, end_date=None)
+    await sensor._get_data(endpoint="halfhourly", start_date=None, end_date=None)
+
+    sensor._entry.async_start_reauth.assert_called_once_with(sensor.hass)
+
+
+async def test_get_data_starts_reauth_again_after_an_intervening_success(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    """A later success (e.g. after reauth completes) re-arms the guard."""
+    sensor = make_sensor()
+    sensor._api.get_data = AsyncMock(side_effect=WatercareAuthError("bad creds"))
+    await sensor._get_data(endpoint="halfhourly", start_date=None, end_date=None)
+
+    sensor._api.get_data = AsyncMock(return_value="usage-data")
+    await sensor._get_data(endpoint="halfhourly", start_date=None, end_date=None)
+
+    sensor._api.get_data = AsyncMock(side_effect=WatercareAuthError("bad creds"))
+    await sensor._get_data(endpoint="halfhourly", start_date=None, end_date=None)
+
+    assert sensor._entry.async_start_reauth.call_count == 2
