@@ -513,6 +513,10 @@ class WatercareUsageSensor(SensorEntity):
                 endpoint=endpoint, start_date=start_date, end_date=end_date
             )
         except WatercareAuthError as err:
+            # Rejected credentials aren't transient -- don't leave the
+            # hourly recovery-retry ladder (_should_poll_now) spinning on a
+            # login that can't succeed until the user completes reauth.
+            self._last_update_failed = False
             if not self._reauth_started:
                 self._reauth_started = True
                 _LOGGER.warning(

@@ -27,6 +27,26 @@ async def test_get_data_starts_reauth_when_credentials_rejected(
     sensor._entry.async_start_reauth.assert_called_once_with(sensor.hass)
 
 
+async def test_get_data_clears_last_update_failed_on_confirmed_auth_rejection(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    """
+    Regression: rejected credentials shouldn't keep the hourly retry ladder alive.
+
+    _should_poll_now() polls hourly (any hour) whenever _last_update_failed
+    is set -- but a confirmed credential rejection can't be fixed by
+    retrying, only by the user completing reauth, so it must not leave that
+    ladder spinning.
+    """
+    sensor = make_sensor()
+    sensor._last_update_failed = True
+    sensor._api.get_data = AsyncMock(side_effect=WatercareAuthError("bad creds"))
+
+    await sensor._get_data(endpoint="halfhourly", start_date=None, end_date=None)
+
+    assert sensor._last_update_failed is False
+
+
 async def test_get_data_passes_through_response_without_starting_reauth(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:

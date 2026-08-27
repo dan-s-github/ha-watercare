@@ -156,8 +156,13 @@ class WatercareApi:
 
                 query_params = parse_qs(location.split("?", 1)[1])
                 if "error" in query_params:
-                    _LOGGER.error("Error in response: %s", query_params["error"][0])
-                    _LOGGER.error(
+                    # DEBUG, not ERROR: every poll re-runs this full login
+                    # while _accountNumber stays unset, so ERROR here would
+                    # repeat every retry -- the raised WatercareAuthError
+                    # (and the caller's single deduped warning) is the
+                    # user-facing signal.
+                    _LOGGER.debug("Error in response: %s", query_params["error"][0])
+                    _LOGGER.debug(
                         "Error description: %s", query_params["error_description"][0]
                     )
                     msg = (
