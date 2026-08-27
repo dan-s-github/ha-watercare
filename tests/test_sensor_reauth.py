@@ -113,3 +113,36 @@ async def test_get_data_unrelated_none_response_does_not_rearm_the_guard(
     await sensor._get_data(endpoint="halfhourly", start_date=None, end_date=None)
 
     sensor._entry.async_start_reauth.assert_called_once_with(sensor.hass)
+
+
+async def test_async_update_skips_processing_while_reauth_is_pending(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    """
+    Regression: don't spam a "no response" error every poll while reauth is pending.
+
+    process_*'s _parse_json_response logs an ERROR whenever it's handed a
+    None response -- useful for a genuine transient failure, but redundant
+    (and spammy on the hourly recovery ladder) once reauth already told the
+    user what's wrong, so async_update must skip processing in that case.
+    """
+    sensor = make_sensor()
+    sensor._api.get_data = AsyncMock(side_effect=WatercareAuthError("bad creds"))
+    sensor.process_halfhourly_data = AsyncMock()
+
+    await sensor.async_update()
+
+    sensor.process_halfhourly_data.assert_not_called()
+
+
+async def test_async_update_still_processes_an_unrelated_none_response(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    """A non-auth None response (e.g. a transient failure) must still be processed."""
+    sensor = make_sensor()
+    sensor._api.get_data = AsyncMock(return_value=None)
+    sensor.process_halfhourly_data = AsyncMock()
+
+    await sensor.async_update()
+
+    sensor.process_halfhourly_data.assert_called_once_with(None)

@@ -569,6 +569,13 @@ class WatercareUsageSensor(SensorEntity):
             )
             if response is not None:
                 self._last_update_failed = False
+            elif self._reauth_started:
+                # Reauth already surfaces this to the user (one deduped
+                # warning + a Settings prompt) -- skip the generic "no
+                # response" error every poll while it's pending, so the
+                # hourly recovery ladder doesn't spam the log for the
+                # entire outage.
+                return
 
             # Route to appropriate processing method based on endpoint
             if self._endpoint == "dailywithstats":
