@@ -105,13 +105,19 @@ FULL_HISTORY_LOOKBACK_DAYS = 1095
 # therefore every future poll, forever.
 _RECORDER_FLUSH_TIMEOUT = 30
 
+# The halfhourly endpoint's regular-poll rolling fetch window (see
+# async_update) -- how many days back of readings each poll requests.
+HALFHOURLY_POLL_WINDOW_DAYS = 7
+
 # How many of the most recent hourly statistics to fetch in one query when
 # looking for the anchor sum just before a healing window starts (see
-# _async_statistics_window). Comfortably more than the halfhourly endpoint's
-# 7-day (168-hour) regular-poll fetch window, even accounting for the window
-# itself being sparse -- the exact gap this healing is fixing -- so the
-# anchor is reliably found in a single query.
-_HEAL_LOOKBACK_STATS = 24 * 10
+# _async_statistics_window). Derived from HALFHOURLY_POLL_WINDOW_DAYS (with
+# a safety margin) rather than a bare number, so the two can't silently
+# drift apart -- if this ever ends up smaller than the poll window, the
+# anchor lookup can miss and silently fall back to a 0.0 anchor (see
+# _async_statistics_window's docstring), which looks like a meter reset.
+_HEAL_LOOKBACK_MARGIN_DAYS = 3
+_HEAL_LOOKBACK_STATS = 24 * (HALFHOURLY_POLL_WINDOW_DAYS + _HEAL_LOOKBACK_MARGIN_DAYS)
 
 
 async def async_setup_entry(
@@ -504,7 +510,9 @@ class WatercareUsageSensor(SensorEntity):
                 # Unlike the other endpoints, halfhourly has no server-side
                 # default range and 400s (INVALID_REQUEST_BODY) without one.
                 today = datetime.now(NZ_TIMEZONE).date()
-                start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+                start_date = (
+                    today - timedelta(days=HALFHOURLY_POLL_WINDOW_DAYS)
+                ).strftime("%Y-%m-%d")
                 end_date = today.strftime("%Y-%m-%d")
             elif self._endpoint in ("dailywithstats", "monthly"):
                 # These also have no server-side default range and 400 without
@@ -978,6 +986,7 @@ class WatercareUsageSensor(SensorEntity):
         statistic_id: str,
         heal_since: datetime,
         cost_key: str | None,
+        fresh_hours: set[datetime] | None = None,
     ) -> list[StatisticData]:
         """
         Rebuild every hour from `heal_since` onward.
@@ -997,12 +1006,40 @@ class WatercareUsageSensor(SensorEntity):
         it) means a hole from one poll's sparse response gets healed the
         next time the API returns more for that hour, with no risk of
         clobbering an hour this poll didn't see: those keep their already-
-        stored sum via `existing_sums`, they're just not re-sent.
+        stored sum via `existing_sums`, they're just not re-sent as-is --
+        see the delta carry-forward below for why they can still change.
 
         Any `hourly_consumption` hour before `heal_since` is ignored -- it's
         outside the window `anchor_sum` accounts for, so folding it into the
         running sum would double-count it against whatever's already stored
         there.
+
+        `fresh_hours` marks which hours actually changed this poll and
+        should be recomputed from `hourly_consumption`; every other hour
+        carries its existing stored sum forward instead (see `delta`
+        below). Defaults to every hour with a reading this poll -- the
+        right behavior for the plain consumption series, where "has a
+        reading" and "may have changed" are the same thing. Cost series
+        pass the *consumption* series' own touched-hour set instead: cost
+        is a pure function of litres and the currently configured rate, so
+        recomputing it for the whole window unconditionally would silently
+        rewrite already-published cost history the moment the user changes
+        a rate, even for hours whose litres never changed. Restricting to
+        the hours consumption actually touched means only a genuine litres
+        change (fresh data, or a delta cascading from an earlier fix, see
+        below) can move cost history -- a rate change alone can't.
+
+        A hole (no fresh, unrestricted reading this hour) carries forward
+        via `delta`: the gap between the running sum this function has
+        just computed and the sum that was already stored for the last
+        hour it touched. Without this, healing an earlier hour upward (or
+        downward) while a later hour in the same window goes untouched
+        would leave the later hour's stored sum unchanged -- producing a
+        non-monotonic sum sequence (a decreasing "cumulative" total) the
+        moment the two are compared, e.g. in the Energy dashboard. Shifting
+        every untouched hour by the same delta keeps the whole window
+        internally consistent, and reduces to a no-op (delta stays 0, no
+        extra writes) whenever nothing needed correcting.
 
         A recomputed hour whose sum comes out unchanged from what's already
         stored (within floating-point tolerance -- cost series in
@@ -1012,6 +1049,9 @@ class WatercareUsageSensor(SensorEntity):
         so without this most hours would upsert a functionally-unchanged
         value every single time.
         """
+        if fresh_hours is None:
+            fresh_hours = set(hourly_consumption)
+
         anchor_sum, existing_sums = await self._async_statistics_window(
             statistic_id, heal_since
         )
@@ -1019,26 +1059,35 @@ class WatercareUsageSensor(SensorEntity):
             hour for hour in hourly_consumption if hour >= heal_since
         } | set(existing_sums)
         running_sum = anchor_sum
+        delta = 0.0
         points = []
         for hour_start in sorted(healed_hours):
-            if hour_start in hourly_consumption:
+            old_sum = existing_sums.get(hour_start)
+            # Always recompute an hour with no existing stored sum at all
+            # (nothing to carry forward from), even if it's outside
+            # fresh_hours -- e.g. a cost series that was previously gated
+            # off by a zero rate and has no history yet to preserve.
+            if hour_start in hourly_consumption and (
+                hour_start in fresh_hours or old_sum is None
+            ):
                 litres = hourly_consumption[hour_start]
                 if cost_key is None:
                     running_sum += litres
                 else:
                     running_sum += self._calculate_cost(litres, 1 / 24)[cost_key]
-                if not math.isclose(
-                    existing_sums.get(hour_start, math.nan),
-                    running_sum,
-                    rel_tol=1e-9,
-                    abs_tol=1e-9,
+                if old_sum is not None:
+                    delta = running_sum - old_sum
+                if old_sum is None or not math.isclose(
+                    old_sum, running_sum, rel_tol=1e-9, abs_tol=1e-9
                 ):
                     points.append(StatisticData(start=hour_start, sum=running_sum))
             else:
-                # Not in this poll's readings -- carry its already-stored
-                # sum forward so later healed hours' running totals stay
-                # correct, without re-sending a point for it.
-                running_sum = existing_sums[hour_start]
+                # Not touched this poll -- carry its already-stored sum
+                # forward, shifted by whatever correction delta the most
+                # recently touched hour introduced (see delta above).
+                running_sum = existing_sums[hour_start] + delta
+                if not math.isclose(delta, 0.0, abs_tol=1e-9):
+                    points.append(StatisticData(start=hour_start, sum=running_sum))
         return points
 
     async def _async_await_recorder_flush(self) -> None:
@@ -1085,6 +1134,8 @@ class WatercareUsageSensor(SensorEntity):
         rate_gate: float | None,
         unit_class: str | None = None,
         heal_since: datetime | None = None,
+        fresh_hours: set[datetime] | None = None,
+        touched_hours: set[datetime] | None = None,
     ) -> int:
         """
         Push one hourly external-statistics series.
@@ -1102,6 +1153,14 @@ class WatercareUsageSensor(SensorEntity):
         onward instead (see _async_heal_hourly_points): the regular poll's
         fetch window is only ~7 days, cheap to fully requery, and doing so
         heals any gap a previous poll's sparse API response left behind.
+        `fresh_hours` is forwarded to it unchanged (see its docstring for
+        why a cost series passes something narrower than "every hour with
+        a reading").
+
+        If `touched_hours` is given, it's updated with the start of every
+        point actually written this call -- so a caller pushing several
+        series in sequence (see _async_push_halfhourly_statistics) can feed
+        one series' result in as the next series' `fresh_hours`.
 
         Returns the number of points actually written -- callers that
         expect to backfill older history should check this, since it will
@@ -1118,6 +1177,7 @@ class WatercareUsageSensor(SensorEntity):
                 statistic_id=statistic_id,
                 heal_since=heal_since,
                 cost_key=cost_key,
+                fresh_hours=fresh_hours,
             )
         else:
             running_sum, last_start = await self._async_last_statistic_sum(statistic_id)
@@ -1131,6 +1191,9 @@ class WatercareUsageSensor(SensorEntity):
                 else:
                     running_sum += self._calculate_cost(litres, 1 / 24)[cost_key]
                 new_points.append(StatisticData(start=hour_start, sum=running_sum))
+
+        if touched_hours is not None:
+            touched_hours.update(point["start"] for point in new_points)
 
         push_statistic_series(
             self.hass,
@@ -1153,11 +1216,17 @@ class WatercareUsageSensor(SensorEntity):
         Push all four hourly statistic series for the halfhourly endpoint.
 
         See _async_push_hourly_statistic for what `heal_since` changes.
+        Consumption is pushed first (only it can decide which hours
+        genuinely changed -- see _async_heal_hourly_points), then the three
+        cost series run concurrently, each restricted to that same
+        touched-hour set so a rate change alone can't rewrite already-
+        published cost history.
 
         Returns the number of new consumption points written (the other
         three series share the same watermark and will match, unless
         gated off entirely by a zero rate).
         """
+        touched_hours: set[datetime] | None = set() if heal_since is not None else None
         new_count = await self._async_push_hourly_statistic(
             hourly_consumption,
             statistic_id=f"{DOMAIN}:halfhourly_consumption",
@@ -1167,33 +1236,39 @@ class WatercareUsageSensor(SensorEntity):
             rate_gate=None,
             unit_class=VolumeConverter.UNIT_CLASS,
             heal_since=heal_since,
+            touched_hours=touched_hours,
         )
-        await self._async_push_hourly_statistic(
-            hourly_consumption,
-            statistic_id=f"{DOMAIN}:halfhourly_cost",
-            name="Watercare Half-hourly Cost",
-            unit="NZD",
-            cost_key="total",
-            rate_gate=None,
-            heal_since=heal_since,
-        )
-        await self._async_push_hourly_statistic(
-            hourly_consumption,
-            statistic_id=f"{DOMAIN}:halfhourly_consumption_cost",
-            name="Watercare Half-hourly Consumption Cost",
-            unit="NZD",
-            cost_key="consumption",
-            rate_gate=self._consumption_rate,
-            heal_since=heal_since,
-        )
-        await self._async_push_hourly_statistic(
-            hourly_consumption,
-            statistic_id=f"{DOMAIN}:halfhourly_wastewater_cost",
-            name="Watercare Half-hourly Wastewater Cost",
-            unit="NZD",
-            cost_key="wastewater",
-            rate_gate=self._wastewater_rate,
-            heal_since=heal_since,
+        await asyncio.gather(
+            self._async_push_hourly_statistic(
+                hourly_consumption,
+                statistic_id=f"{DOMAIN}:halfhourly_cost",
+                name="Watercare Half-hourly Cost",
+                unit="NZD",
+                cost_key="total",
+                rate_gate=None,
+                heal_since=heal_since,
+                fresh_hours=touched_hours,
+            ),
+            self._async_push_hourly_statistic(
+                hourly_consumption,
+                statistic_id=f"{DOMAIN}:halfhourly_consumption_cost",
+                name="Watercare Half-hourly Consumption Cost",
+                unit="NZD",
+                cost_key="consumption",
+                rate_gate=self._consumption_rate,
+                heal_since=heal_since,
+                fresh_hours=touched_hours,
+            ),
+            self._async_push_hourly_statistic(
+                hourly_consumption,
+                statistic_id=f"{DOMAIN}:halfhourly_wastewater_cost",
+                name="Watercare Half-hourly Wastewater Cost",
+                unit="NZD",
+                cost_key="wastewater",
+                rate_gate=self._wastewater_rate,
+                heal_since=heal_since,
+                fresh_hours=touched_hours,
+            ),
         )
         await self._async_await_recorder_flush()
         return new_count

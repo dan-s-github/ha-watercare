@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from custom_components.watercare import sensor as watercare_sensor
 from custom_components.watercare.const import NZ_TIMEZONE
 from tests.conftest import load_fixture, nz_timestamp, nz_timestamp_on
 
@@ -22,6 +23,22 @@ if TYPE_CHECKING:
 @pytest.fixture
 def readings() -> list[dict]:
     return json.loads(load_fixture("halfhourly_readings.json"))
+
+
+def test_heal_lookback_exceeds_the_regular_poll_window() -> None:
+    """
+    Regression: the healing anchor lookback must stay ahead of the poll window.
+
+    _HEAL_LOOKBACK_STATS is derived from HALFHOURLY_POLL_WINDOW_DAYS rather
+    than a bare number specifically so the two can't drift apart -- if the
+    poll window ever grew to meet or exceed the lookback, the anchor query
+    in _async_statistics_window could miss and silently fall back to a 0.0
+    anchor (looks like a meter reset). This pins the derivation itself, not
+    just today's values, so it fails if a future edit reintroduces a gap.
+    """
+    assert watercare_sensor._HEAL_LOOKBACK_STATS > (
+        24 * watercare_sensor.HALFHOURLY_POLL_WINDOW_DAYS
+    )
 
 
 def test_bucket_hourly_readings_sums_half_hours_into_hours(
@@ -323,6 +340,145 @@ async def test_push_hourly_statistic_heal_since_unchanged_skip_tolerates_float_r
 
     assert new_count == 0
     assert "watercare:halfhourly_consumption" not in patch_recorder.written
+
+
+async def test_push_hourly_statistic_heal_since_shifts_untouched_later_hour(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    patch_recorder: SimpleNamespace,
+) -> None:
+    """
+    Regression: correcting an earlier hour must not leave a later hour stale.
+
+    Reproduces a non-monotonic sum sequence: hour_h2 gets a big correction
+    this poll, but hour_h3 (already stored, sparse-response gap from a
+    previous poll) isn't in this poll's response at all. Leaving hour_h3's
+    stored sum untouched would make it chronologically *smaller* than the
+    now-corrected hour_h2 -- a "cumulative" total that decreases, which
+    e.g. the Energy dashboard would render as a large negative usage spike.
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+    nz_now = datetime.now(NZ_TIMEZONE)
+    hour_h2 = nz_now.replace(hour=12, minute=0, second=0, microsecond=0)
+    hour_h3 = hour_h2 + timedelta(hours=1)
+    patch_recorder.stored_statistics["watercare:halfhourly_consumption"] = [
+        (6.0, hour_h2.timestamp()),  # understated by a prior sparse poll
+        (9.0, hour_h3.timestamp()),  # correct on its own, but not refetched
+    ]
+    # This poll only returns hour_h2, with the true (much larger) reading.
+    buckets = {hour_h2: 1000}
+
+    new_count = await sensor._async_push_hourly_statistic(
+        buckets,
+        statistic_id="watercare:halfhourly_consumption",
+        name="Watercare Half-hourly Consumption",
+        unit="L",
+        cost_key=None,
+        rate_gate=None,
+        heal_since=hour_h2,
+    )
+
+    assert new_count == 2  # both hours corrected, even though h3 wasn't refetched
+    points = {
+        p["start"]: p["sum"]
+        for p in patch_recorder.written["watercare:halfhourly_consumption"]
+    }
+    assert points[hour_h2] == 1000
+    # h3 shifts by the same +994 correction, preserving its own +3 delta
+    # over h2 (9 - 6 = 3) instead of staying at its stale absolute value.
+    assert points[hour_h3] == 1003
+    assert points[hour_h3] > points[hour_h2]  # monotonic
+
+
+async def test_heal_hourly_points_carries_zero_delta_hole_unchanged(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    patch_recorder: SimpleNamespace,
+) -> None:
+    """A hole with no preceding correction this poll is still left untouched."""
+    sensor = make_sensor(endpoint="halfhourly")
+    nz_now = datetime.now(NZ_TIMEZONE)
+    hour_h2 = nz_now.replace(hour=12, minute=0, second=0, microsecond=0)
+    hour_h3 = hour_h2 + timedelta(hours=1)
+    patch_recorder.stored_statistics["watercare:halfhourly_consumption"] = [
+        (6.0, hour_h2.timestamp()),
+        (9.0, hour_h3.timestamp()),
+    ]
+    buckets = {hour_h2: 6}  # matches what's already stored -- no correction
+
+    new_count = await sensor._async_push_hourly_statistic(
+        buckets,
+        statistic_id="watercare:halfhourly_consumption",
+        name="Watercare Half-hourly Consumption",
+        unit="L",
+        cost_key=None,
+        rate_gate=None,
+        heal_since=hour_h2,
+    )
+
+    assert new_count == 0
+    assert "watercare:halfhourly_consumption" not in patch_recorder.written
+
+
+async def test_heal_hourly_points_ignores_rate_change_outside_fresh_hours(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    patch_recorder: SimpleNamespace,
+) -> None:
+    """
+    Regression: a rate change alone must not rewrite an untouched hour's cost.
+
+    Cost is a pure function of litres and the *current* rate, so
+    recomputing it for every hour in the window unconditionally would
+    silently rewrite already-published cost history the moment the user
+    changes a rate -- even for hours whose litres never changed. Passing
+    an explicit `fresh_hours` that excludes an hour (as
+    _async_push_halfhourly_statistics does using the consumption series'
+    own touched-hour set) must leave that hour's cost untouched.
+    """
+    sensor = make_sensor(endpoint="halfhourly", consumption_rate=5.0)
+    nz_now = datetime.now(NZ_TIMEZONE)
+    hour_h = nz_now.replace(hour=12, minute=0, second=0, microsecond=0)
+    # Stored cost reflects what an earlier, different rate would have
+    # produced for this same litres value (100L @ rate 2.0 -> 0.2).
+    patch_recorder.stored_statistics["watercare:halfhourly_consumption_cost"] = [
+        (0.2, hour_h.timestamp()),
+    ]
+    buckets = {hour_h: 100}  # same litres as before, just refetched this poll
+
+    points = await sensor._async_heal_hourly_points(
+        buckets,
+        statistic_id="watercare:halfhourly_consumption_cost",
+        heal_since=hour_h,
+        cost_key="consumption",
+        fresh_hours=set(),  # consumption series decided this hour didn't change
+    )
+
+    assert points == []  # not recomputed with the new rate (100/1000*5.0=0.5)
+
+
+async def test_push_halfhourly_statistics_rate_change_does_not_touch_stable_hour(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    patch_recorder: SimpleNamespace,
+) -> None:
+    """Same as above, exercised through the real four-series wiring."""
+    sensor = make_sensor(endpoint="halfhourly", consumption_rate=5.0)
+    nz_now = datetime.now(NZ_TIMEZONE)
+    hour_h = nz_now.replace(hour=12, minute=0, second=0, microsecond=0)
+    # Consumption is unchanged (recomputes to exactly what's stored), so
+    # the consumption series won't touch hour_h -- but its cost was stored
+    # under a different (now-changed) rate.
+    patch_recorder.stored_statistics["watercare:halfhourly_consumption"] = [
+        (100.0, hour_h.timestamp()),
+    ]
+    patch_recorder.stored_statistics["watercare:halfhourly_consumption_cost"] = [
+        (0.2, hour_h.timestamp()),  # 100L @ the old rate of 2.0
+    ]
+    buckets = {hour_h: 100}
+
+    new_count = await sensor._async_push_halfhourly_statistics(
+        buckets, heal_since=hour_h
+    )
+
+    assert new_count == 0  # consumption itself didn't change
+    assert "watercare:halfhourly_consumption_cost" not in patch_recorder.written
 
 
 async def test_push_hourly_statistic_zero_rate_gate_skips_entirely(
