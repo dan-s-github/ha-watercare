@@ -13,9 +13,12 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs
 
 import aiohttp
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+    from homeassistant.core import HomeAssistant
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -23,11 +26,16 @@ _HTTP_OK = 200
 _HTTP_UNAUTHORIZED = 401
 
 
+class WatercareAuthError(Exception):
+    """Raised when Watercare conclusively rejects the account credentials."""
+
+
 class WatercareApi:
     """Define the Watercare API."""
 
-    def __init__(self, email: str, password: str) -> None:
+    def __init__(self, hass: HomeAssistant, email: str, password: str) -> None:
         """Initialise the API."""
+        self._hass = hass
         self._client_id = "799c26af-c35b-4010-bd04-b6a7ebdba811"
         self._redirect_uri = "msauth://nz.co.watercare/yRDm0vmCd9zdnwt1eCLGp8KfdLY%3D"
         self._url_base = "https://customerapp.api.water.co.nz/"
@@ -155,7 +163,7 @@ class WatercareApi:
                     msg = (
                         f"Authentication error: {query_params['error_description'][0]}"
                     )
-                    raise ValueError(msg)
+                    raise WatercareAuthError(msg)
 
             code = query_params["code"][0]
 
@@ -191,27 +199,24 @@ class WatercareApi:
             "refresh_token": self._refresh_token,
         }
 
-        jar = aiohttp.CookieJar(quote_cookie=False)
-        async with aiohttp.ClientSession(cookie_jar=jar) as session:
-            url = f"{self._url_token_base}/{self._p}/oauth2/v2.0/token"
-            async with session.post(url, data=token_data) as response:
-                if response.status == _HTTP_OK:
-                    json_result = await response.json()
-                    self._token = json_result["access_token"]
-                    _LOGGER.debug("Access token retrieved successfully.")
-                    await self.get_accounts()
-                    return True
-                _LOGGER.error("Failed to retrieve the token page.")
-                return False
+        session = async_get_clientsession(self._hass)
+        url = f"{self._url_token_base}/{self._p}/oauth2/v2.0/token"
+        async with session.post(url, data=token_data) as response:
+            if response.status == _HTTP_OK:
+                json_result = await response.json()
+                self._token = json_result["access_token"]
+                _LOGGER.debug("Access token retrieved successfully.")
+                await self.get_accounts()
+                return True
+            _LOGGER.error("Failed to retrieve the token page.")
+            return False
 
     async def get_accounts(self) -> None:
         """Get the first account that we see."""
         headers = {"authorization": "Bearer " + (self._token or "")}
-        jar = aiohttp.CookieJar(quote_cookie=False)
-        async with (
-            aiohttp.ClientSession(cookie_jar=jar) as session,
-            session.get(self._url_base + "v1/account", headers=headers) as result,
-        ):
+        session = async_get_clientsession(self._hass)
+        url = self._url_base + "v1/account"
+        async with session.get(url, headers=headers) as result:
             if result.status == _HTTP_OK:
                 data = await result.json()
                 _LOGGER.debug("Accounts: %s", data)
@@ -323,11 +328,8 @@ class WatercareApi:
 
         _LOGGER.debug("Calling API URL: %s", url)
 
-        jar = aiohttp.CookieJar(quote_cookie=False)
-        async with (
-            aiohttp.ClientSession(cookie_jar=jar) as session,
-            session.get(url, headers=headers) as response,
-        ):
+        session = async_get_clientsession(self._hass)
+        async with session.get(url, headers=headers) as response:
             if response.status == _HTTP_OK:
                 data = await response.text()
                 _LOGGER.debug("API Response status: %s", response.status)

@@ -18,6 +18,7 @@ from homeassistant.components.sensor import SensorEntity
 from homeassistant.helpers.event import async_track_time_change
 from homeassistant.util.unit_conversion import VolumeConverter
 
+from .api import WatercareAuthError
 from .const import (
     CONF_ANNUAL_LINE_CHARGE,
     CONF_CONSUMPTION_RATE,
@@ -489,6 +490,25 @@ class WatercareUsageSensor(SensorEntity):
         type_name = STATISTIC_TYPES.get(statistic_type, statistic_type.title())
         return f"Watercare {endpoint_name} {type_name}"
 
+    async def _get_data(
+        self, endpoint: str, start_date: str | None, end_date: str | None
+    ) -> str | None:
+        """
+        Fetch data, starting HA's reauth flow if Watercare rejects the credentials.
+
+        A rejected password/refresh token isn't a transient failure the
+        normal retry ladder can recover from -- surface it the standard HA
+        way (a reauth prompt in Settings) instead of just logging forever.
+        """
+        try:
+            return await self._api.get_data(
+                endpoint=endpoint, start_date=start_date, end_date=end_date
+            )
+        except WatercareAuthError:
+            _LOGGER.warning("Watercare credentials rejected; starting reauth flow")
+            self._entry.async_start_reauth(self.hass)
+            return None
+
     async def async_update(self) -> None:
         """Update the sensor data."""
         # The lock serializes this against a concurrently running deep
@@ -521,7 +541,7 @@ class WatercareUsageSensor(SensorEntity):
             # exception anywhere in the fetch also leaves the flag set and
             # _should_poll_now schedules hourly recovery retries.
             self._last_update_failed = True
-            response = await self._api.get_data(
+            response = await self._get_data(
                 endpoint=self._endpoint, start_date=start_date, end_date=end_date
             )
             if response is not None:
@@ -1302,7 +1322,7 @@ class WatercareUsageSensor(SensorEntity):
 
         while (today - chunk_end).days < HALFHOURLY_BACKFILL_MAX_DAYS:
             chunk_start = chunk_end - timedelta(days=HALFHOURLY_BACKFILL_CHUNK_DAYS)
-            response = await self._api.get_data(
+            response = await self._get_data(
                 endpoint="halfhourly",
                 start_date=chunk_start.strftime("%Y-%m-%d"),
                 end_date=chunk_end.strftime("%Y-%m-%d"),
