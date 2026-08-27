@@ -520,7 +520,12 @@ class WatercareUsageSensor(SensorEntity):
                 )
                 self._entry.async_start_reauth(self.hass)
             return None
-        self._reauth_started = False
+        if response is not None:
+            # Only an actual successful response re-arms the guard -- an
+            # unrelated transient failure (e.g. a non-200 from the usage
+            # endpoint) also returns None without raising, and must not be
+            # mistaken for recovery.
+            self._reauth_started = False
         return response
 
     async def async_update(self) -> None:

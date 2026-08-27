@@ -70,3 +70,26 @@ async def test_get_data_starts_reauth_again_after_an_intervening_success(
     await sensor._get_data(endpoint="halfhourly", start_date=None, end_date=None)
 
     assert sensor._entry.async_start_reauth.call_count == 2
+
+
+async def test_get_data_unrelated_none_response_does_not_rearm_the_guard(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    """
+    Regression: only a real success may clear _reauth_started.
+
+    An unrelated transient failure (e.g. a non-200 from the usage endpoint)
+    also returns None without raising WatercareAuthError -- that must not
+    be mistaken for recovery and silently re-arm the reauth spam guard.
+    """
+    sensor = make_sensor()
+    sensor._api.get_data = AsyncMock(side_effect=WatercareAuthError("bad creds"))
+    await sensor._get_data(endpoint="halfhourly", start_date=None, end_date=None)
+
+    sensor._api.get_data = AsyncMock(return_value=None)
+    await sensor._get_data(endpoint="halfhourly", start_date=None, end_date=None)
+
+    sensor._api.get_data = AsyncMock(side_effect=WatercareAuthError("bad creds"))
+    await sensor._get_data(endpoint="halfhourly", start_date=None, end_date=None)
+
+    sensor._entry.async_start_reauth.assert_called_once_with(sensor.hass)
