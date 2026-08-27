@@ -4,20 +4,41 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
-from unittest.mock import AsyncMock
+from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
 import pytest
 from aioresponses import aioresponses
 
-from custom_components.watercare.api import WatercareApi
+import custom_components.watercare.api as api_module
+from custom_components.watercare.api import WatercareApi, WatercareAuthError
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 BASE_URL = "https://customerapp.api.water.co.nz/"
 
 
+@pytest.fixture(autouse=True)
+async def _clientsession(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[aiohttp.ClientSession]:
+    """
+    Stand in for HA's shared aiohttp session.
+
+    api.py fetches its session via async_get_clientsession(hass), which
+    needs a real HomeAssistant instance to cache against -- swap in a plain
+    aiohttp.ClientSession instead so tests don't need a full hass fixture.
+    """
+    session = aiohttp.ClientSession()
+    monkeypatch.setattr(api_module, "async_get_clientsession", lambda _hass: session)
+    yield session
+    await session.close()
+
+
 def _make_api() -> WatercareApi:
-    return WatercareApi("user@example.com", "hunter2")
+    return WatercareApi(MagicMock(), "user@example.com", "hunter2")
 
 
 async def test_get_data_invalid_endpoint_raises_before_any_network_call() -> None:
@@ -227,6 +248,35 @@ class _FakeGetContextManager:
 
     async def __aexit__(self, *_exc_info: object) -> bool:
         return False
+
+
+async def test_get_refresh_token_raises_on_confirmed_sign_in_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B2C confirming a real credential rejection must surface as WatercareAuthError."""
+    api = _make_api()
+
+    settings_response = _FakeResponse(
+        200, 'var SETTINGS = {"transId": "tx123", "csrf": "csrf123"};'
+    )
+    confirmed_response = _FakeResponse(302, "")
+    confirmed_response.headers["Location"] = (
+        "msauth://nz.co.watercare/callback"
+        "?error=access_denied&error_description=Bad+password"
+    )
+    get_responses = iter([settings_response, confirmed_response])
+
+    def fake_get(_self: aiohttp.ClientSession, _url: str, **_kwargs: Any) -> Any:
+        return _FakeGetContextManager(next(get_responses))
+
+    def fake_post(_self: aiohttp.ClientSession, _url: str, **_kwargs: Any) -> Any:
+        return _FakeGetContextManager(_FakeResponse(200, ""))
+
+    monkeypatch.setattr(aiohttp.ClientSession, "get", fake_get)
+    monkeypatch.setattr(aiohttp.ClientSession, "post", fake_post)
+
+    with pytest.raises(WatercareAuthError, match="Bad password"):
+        await api.get_refresh_token()
 
 
 async def test_get_data_http_request_runs_with_lock_released(
