@@ -15,7 +15,9 @@ from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticData
 from homeassistant.components.recorder.statistics import get_last_statistics
 from homeassistant.components.sensor import SensorEntity
+from homeassistant.core import callback
 from homeassistant.helpers.event import async_track_time_change
+from homeassistant.helpers.start import async_at_started
 from homeassistant.util.unit_conversion import VolumeConverter
 
 from .api import WatercareAuthError
@@ -40,6 +42,8 @@ from .const import (
 from .statistics_helpers import accumulate_cost_series, push_statistic_series
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -268,21 +272,26 @@ class WatercareUsageSensor(SensorEntity):
         alongside async_add_entities() in async_setup_entry so it can't
         possibly run before hass/entity_id are set on this entity -- HA
         only calls async_added_to_hass() once the entity is fully added
-        to the platform. Fixed-time polling isn't scheduled here: the
-        standing tick subscription is registered once the initial
-        backfill/update task finishes (see _run_backfill/
-        _run_initial_update), so the first scheduled poll can't land
-        mid-backfill; _update_lock additionally serializes any update
-        against a backfill regardless of who started them.
+        to the platform. The fetch itself is held back until Home Assistant
+        has finished starting (see _run_after_hass_started). Fixed-time
+        polling isn't scheduled here: the standing tick subscription is
+        registered once the initial backfill/update task finishes (see
+        _run_backfill/_run_initial_update), so the first scheduled poll
+        can't land mid-backfill; _update_lock additionally serializes any
+        update against a backfill regardless of who started them.
         """
         await super().async_added_to_hass()
         if self._needs_backfill:
             self._entry.async_create_background_task(
-                self.hass, self._run_backfill(), "watercare_history_backfill"
+                self.hass,
+                self._run_after_hass_started(self._run_backfill),
+                "watercare_history_backfill",
             )
         else:
             self._entry.async_create_background_task(
-                self.hass, self._run_initial_update(), "watercare_initial_update"
+                self.hass,
+                self._run_after_hass_started(self._run_initial_update),
+                "watercare_initial_update",
             )
 
     async def async_will_remove_from_hass(self) -> None:
@@ -374,6 +383,37 @@ class WatercareUsageSensor(SensorEntity):
             _LOGGER.exception("Watercare scheduled update failed")
         if self._unsub_scheduled_poll is not None:
             self.async_write_ha_state()
+
+    async def _run_after_hass_started(
+        self, startup_job: Callable[[], Awaitable[None]]
+    ) -> None:
+        """
+        Run `startup_job` once Home Assistant has finished starting.
+
+        The recorder connects to its database early in startup but doesn't
+        process its write queue until EVENT_HOMEASSISTANT_STARTED, so
+        statistics pushed while HA is still starting just sit queued --
+        and _async_await_recorder_flush's timeout would expire (and warn
+        on every restart) whenever the rest of startup takes longer than
+        that, with nothing actually wrong with the recorder. Waiting here
+        instead means that timeout only ever measures a recorder that is
+        actually draining its queue. Returns straight away if HA is
+        already running (e.g. the config entry was reloaded).
+        """
+        started = asyncio.Event()
+
+        @callback
+        def _hass_started(_hass: HomeAssistant) -> None:
+            started.set()
+
+        unsub = async_at_started(self.hass, _hass_started)
+        try:
+            await started.wait()
+        finally:
+            # Unloading the config entry cancels this task; don't leave the
+            # listener behind on a defunct entity.
+            unsub()
+        await startup_job()
 
     async def _run_backfill(self) -> None:
         # Nothing awaits this background task, so an unhandled exception
