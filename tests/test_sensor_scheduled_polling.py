@@ -6,7 +6,8 @@ import asyncio
 import logging
 from datetime import date as date_type
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -434,3 +435,80 @@ async def test_will_remove_from_hass_is_a_noop_when_never_scheduled(
     await sensor.async_will_remove_from_hass()
 
     assert sensor._unsub_scheduled_poll is None
+
+
+def _patch_async_at_started(
+    monkeypatch: pytest.MonkeyPatch, *, already_started: bool
+) -> SimpleNamespace:
+    """Replace async_at_started with a fake the test fires by hand."""
+    fake = SimpleNamespace(callback=None, unsub=MagicMock())
+
+    def fake_async_at_started(hass: Any, at_start_cb: Callable) -> Callable:
+        if already_started:
+            at_start_cb(hass)
+        else:
+            fake.callback = at_start_cb
+        return fake.unsub
+
+    monkeypatch.setattr(watercare_sensor, "async_at_started", fake_async_at_started)
+    return fake
+
+
+async def test_startup_job_waits_for_hass_started(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Regression: the first fetch must not run while HA is still starting.
+
+    The recorder doesn't process its queue until HA has started, so
+    statistics pushed any earlier sat unwritten and
+    _async_await_recorder_flush timed out with a warning on every restart.
+    """
+    sensor = make_sensor()
+    fake = _patch_async_at_started(monkeypatch, already_started=False)
+    startup_job = AsyncMock()
+
+    task = asyncio.create_task(sensor._run_after_hass_started(startup_job))
+    await asyncio.sleep(0)
+
+    startup_job.assert_not_called()
+
+    fake.callback(sensor.hass)
+    await task
+
+    startup_job.assert_awaited_once()
+    fake.unsub.assert_called_once()
+
+
+async def test_startup_job_runs_immediately_when_hass_already_started(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sensor = make_sensor()
+    _patch_async_at_started(monkeypatch, already_started=True)
+    startup_job = AsyncMock()
+
+    await sensor._run_after_hass_started(startup_job)
+
+    startup_job.assert_awaited_once()
+
+
+async def test_startup_job_cancelled_before_hass_started_unsubscribes(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unloading the entry mid-startup must drop the listener, not run the job."""
+    sensor = make_sensor()
+    fake = _patch_async_at_started(monkeypatch, already_started=False)
+    startup_job = AsyncMock()
+
+    task = asyncio.create_task(sensor._run_after_hass_started(startup_job))
+    await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    startup_job.assert_not_called()
+    fake.unsub.assert_called_once()
