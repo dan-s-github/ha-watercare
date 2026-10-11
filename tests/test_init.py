@@ -89,6 +89,21 @@ async def test_migration_handles_legacy_email_key_and_unique_id_clash() -> None:
     assert kwargs["unique_id"] is None
 
 
+async def test_migration_strips_username_typed_with_stray_whitespace() -> None:
+    hass = MagicMock()
+    hass.config_entries.async_entries.return_value = []
+    entry = _v1_entry(
+        data={"username": " Me@Example.com ", "password": "p"}, options={}
+    )
+
+    await async_migrate_entry(hass, entry)
+
+    kwargs = hass.config_entries.async_update_entry.call_args.kwargs
+    assert kwargs["data"]["username"] == "Me@Example.com"
+    assert kwargs["unique_id"] == "me@example.com"
+    assert kwargs["title"] == "Me@Example.com"
+
+
 async def test_migration_refuses_unknown_future_version() -> None:
     assert await async_migrate_entry(MagicMock(), _v1_entry(version=3)) is False
 

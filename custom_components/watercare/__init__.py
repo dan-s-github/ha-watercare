@@ -53,7 +53,11 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if entry.data.get(CONF_HISTORY_BACKFILLED):
             account_data[CONF_HISTORY_BACKFILLED] = True
 
-        username = entry.data.get(CONF_USERNAME) or entry.data.get("email")
+        # v1 stored the username as typed; strip it like the v2 flows do, or
+        # a stray autofill space would make every reauth a "wrong_account".
+        username = (
+            entry.data.get(CONF_USERNAME) or entry.data.get("email") or ""
+        ).strip()
         unique_id = entry.unique_id
         if unique_id is None and username:
             candidate = username.lower()
