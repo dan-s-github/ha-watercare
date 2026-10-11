@@ -260,7 +260,14 @@ class WatercareApi:
             self._url_base + "v1/account",
             "https://api.watercare.co.nz/account/Accounts",
         ):
-            accounts = await self._fetch_accounts_from(url)
+            try:
+                accounts = await self._fetch_accounts_from(url)
+            except (aiohttp.ClientError, TimeoutError, ValueError) as err:
+                # The outage behind the 500s can equally show up as a reset,
+                # a timeout or a non-JSON maintenance page; still try the
+                # next endpoint. (ValueError: body that isn't valid JSON.)
+                _LOGGER.warning("Account lookup at %s failed: %r", url, err)
+                continue
             if accounts:
                 return accounts
         return []

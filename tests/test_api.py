@@ -333,6 +333,32 @@ async def test_get_accounts_falls_back_to_myaccount_endpoint() -> None:
     assert api._accountNumber == "5150"
 
 
+@pytest.mark.parametrize(
+    "v1_failure",
+    [
+        {"exception": aiohttp.ServerDisconnectedError()},
+        {"exception": TimeoutError()},
+        {"status": 200, "body": "<html>Down for maintenance</html>"},
+        {"status": 200, "body": "not json", "content_type": "application/json"},
+    ],
+    ids=["disconnect", "timeout", "html-page", "invalid-json"],
+)
+async def test_get_accounts_falls_back_when_v1_account_raises(
+    v1_failure: dict[str, Any],
+) -> None:
+    api = _make_api()
+    api._token = "tok"
+
+    with aioresponses() as mocked:
+        mocked.get(f"{BASE_URL}v1/account", **v1_failure)
+        mocked.get(
+            MYACCOUNT_ACCOUNTS_URL, status=200, payload=[{"accountNumber": "5150"}]
+        )
+        await api.get_accounts()
+
+    assert api._accountNumber == "5150"
+
+
 async def test_get_accounts_logs_each_failed_endpoint_when_both_fail(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
