@@ -194,7 +194,6 @@ class WatercareApi:
                 self._access_token_expires_in = response_data.get("expires_in")
 
             _LOGGER.debug("Refresh token retrieved successfully.")
-            await self.get_accounts()
 
     async def get_api_token(self) -> bool:
         """Get token from the Watercare API. Returns whether it succeeded."""
@@ -211,14 +210,45 @@ class WatercareApi:
                 json_result = await response.json()
                 self._token = json_result["access_token"]
                 _LOGGER.debug("Access token retrieved successfully.")
-                await self.get_accounts()
                 return True
             _LOGGER.error("Failed to retrieve the token page.")
             return False
 
     async def get_accounts(self) -> None:
         """
-        Get the first account that we see.
+        Set the default account: the first one on the login.
+
+        Only used by get_data() calls that don't name an account -- the
+        account subentry migrated from a pre-subentry entry, until its
+        account number has been resolved and stored.
+        """
+        accounts = await self._fetch_accounts()
+        if accounts:
+            self._accountNumber = accounts[0]["account_number"]
+            _LOGGER.debug("AccountNumber: %s", self._accountNumber)
+            return
+        _LOGGER.error("Failed to fetch customer accounts")
+
+    async def async_get_accounts(self) -> list[dict[str, str | None]]:
+        """
+        Log in if needed and return every account on the login.
+
+        Each account is {"account_number": ..., "address": ...}; the address
+        may be None. Raises WatercareAuthError if Watercare rejects the
+        credentials. An empty list means signing in worked but neither
+        account endpoint returned any accounts.
+        """
+        async with self._lock:
+            if not self._token:
+                await self.get_refresh_token()
+            if not self._token:
+                msg = "Sign-in completed without an access token"
+                raise ValueError(msg)
+            return await self._fetch_accounts()
+
+    async def _fetch_accounts(self) -> list[dict[str, str | None]]:
+        """
+        Return the login's accounts, trying each account endpoint in turn.
 
         /v1/account has been seen returning 500 {"code":"UNKNOWN_ERROR"} --
         for Watercare's own app too -- while the usage endpoints keep
@@ -230,15 +260,13 @@ class WatercareApi:
             self._url_base + "v1/account",
             "https://api.watercare.co.nz/account/Accounts",
         ):
-            account_number = await self._get_account_number(url)
-            if account_number:
-                _LOGGER.debug("AccountNumber: %s", account_number)
-                self._accountNumber = account_number
-                return
-        _LOGGER.error("Failed to fetch customer accounts")
+            accounts = await self._fetch_accounts_from(url)
+            if accounts:
+                return accounts
+        return []
 
-    async def _get_account_number(self, url: str) -> str | None:
-        """Return the first account number from one account endpoint, or None."""
+    async def _fetch_accounts_from(self, url: str) -> list[dict[str, str | None]]:
+        """Return the accounts from one account endpoint, or [] on failure."""
         headers = {"authorization": "Bearer " + (self._token or "")}
         session = async_get_clientsession(self._hass)
         async with session.get(url, headers=headers) as result:
@@ -249,24 +277,40 @@ class WatercareApi:
                     result.status,
                     await result.text(),
                 )
-                return None
+                return []
             data = await result.json()
 
         if not data or not isinstance(data, list):
             _LOGGER.warning("No accounts found in the response from %s", url)
-            return None
+            return []
         # Count only: the MyAccount response also carries names, addresses
         # and phone numbers, which have no business in debug logs.
         _LOGGER.debug("Account lookup at %s returned %s account(s)", url, len(data))
-        account_number = data[0].get("accountNumber")
-        if not account_number:
+        accounts = [
+            {
+                "account_number": str(account["accountNumber"]),
+                "address": account.get("propertyAddress") or account.get("address"),
+            }
+            for account in data
+            if isinstance(account, dict) and account.get("accountNumber")
+        ]
+        if not accounts:
             _LOGGER.warning("Account number not found in the response from %s", url)
-        return account_number
+        return accounts
 
     async def get_data(
-        self, endpoint: str, start_date: str | None = None, end_date: str | None = None
+        self,
+        endpoint: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        account_number: str | None = None,
     ) -> str | None:
-        """Get data from the API."""
+        """
+        Get usage data for `account_number`.
+
+        Without an account number, uses the login's first account (looked
+        up on first use) -- see get_accounts().
+        """
         if endpoint not in [
             "halfhourly",
             "dailywithstats",
@@ -276,11 +320,13 @@ class WatercareApi:
             msg = "Invalid endpoint specified"
             raise ValueError(msg)
 
-        if not await self._ensure_authenticated():
+        if not await self._ensure_authenticated(
+            need_default_account=account_number is None
+        ):
             return None
 
         status, data, error_text = await self._request_usage(
-            endpoint, start_date, end_date
+            endpoint, start_date, end_date, account_number
         )
         if status == _HTTP_UNAUTHORIZED:
             # Access token expired/rejected -- get_data() previously only
@@ -289,23 +335,22 @@ class WatercareApi:
             # later poll would 401. Re-authenticate once and retry.
             _LOGGER.debug("Access token rejected (401); re-authenticating and retrying")
             async with self._lock:
+                stale_token = self._token
                 # The refresh-token grant can itself fail (e.g. the refresh
                 # token has expired) without raising -- it just leaves
-                # _token/_accountNumber as they were, which would otherwise
-                # look like a no-op success and retry with the same stale
-                # token. Fall back to a full login whenever it doesn't
-                # actually get us a fresh token.
+                # _token as it was, which would otherwise look like a no-op
+                # success and retry with the same stale token. Fall back to
+                # a full login whenever it doesn't actually get us a fresh
+                # token.
                 refreshed = bool(self._refresh_token) and await self.get_api_token()
                 if not refreshed:
                     await self.get_refresh_token()
-                if not self._accountNumber or not self._token:
-                    _LOGGER.error(
-                        "Re-authentication failed - no account number obtained"
-                    )
+                if not self._token or self._token == stale_token:
+                    _LOGGER.error("Re-authentication failed - no new access token")
                     return None
 
             status, data, error_text = await self._request_usage(
-                endpoint, start_date, end_date
+                endpoint, start_date, end_date, account_number
             )
 
         if status != _HTTP_OK:
@@ -314,8 +359,8 @@ class WatercareApi:
             return None
         return data
 
-    async def _ensure_authenticated(self) -> bool:
-        """Authenticate if we don't yet have an account number."""
+    async def _ensure_authenticated(self, *, need_default_account: bool) -> bool:
+        """Log in if there's no access token, and resolve the default account."""
         # Serialize the whole re-authentication flow, not just the state
         # mutation: the regular poll and an on-demand backfill can both land
         # here around the same time, and we don't want two concurrent OAuth
@@ -323,21 +368,30 @@ class WatercareApi:
         # request in _request_usage() runs outside the lock, so a
         # long-running backfill doesn't stall regular polling waiting on it.
         async with self._lock:
-            if not self._accountNumber:
-                _LOGGER.debug(
-                    "No account number found, starting authentication process"
-                )
+            if not self._token:
+                _LOGGER.debug("No access token, starting authentication process")
                 await self.get_refresh_token()
+                if not self._token:
+                    _LOGGER.error("Authentication failed - no access token obtained")
+                    return False
+            if need_default_account and not self._accountNumber:
+                await self.get_accounts()
                 if not self._accountNumber:
                     _LOGGER.error("Authentication failed - no account number obtained")
                     return False
             return True
+
+    @property
+    def default_account_number(self) -> str | None:
+        """Return the login's first account, once get_accounts() has run."""
+        return self._accountNumber
 
     async def _request_usage(
         self,
         endpoint: str,
         start_date: str | None,
         end_date: str | None,
+        account_number: str | None,
     ) -> tuple[int, str | None, str | None]:
         """
         Make a single usage request against a snapshot of the auth state.
@@ -347,7 +401,7 @@ class WatercareApi:
         request.
         """
         async with self._lock:
-            account_number = self._accountNumber
+            account_number = account_number or self._accountNumber
             token = self._token
 
         headers = {"authorization": "Bearer " + (token or "")}

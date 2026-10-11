@@ -349,3 +349,91 @@ async def test_get_accounts_logs_each_failed_endpoint_when_both_fail(
     assert any("status 500" in m for m in messages)
     assert any("status 503" in m for m in messages)
     assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+
+async def test_get_data_for_named_account_skips_default_account_lookup() -> None:
+    api = _make_api()
+    api._token = "tok"
+    api.get_accounts = AsyncMock()
+
+    with aioresponses() as mocked:
+        mocked.get(f"{BASE_URL}v1/usage/777/halfhourly", status=200, body="usage")
+
+        result = await api.get_data(endpoint="halfhourly", account_number="777")
+
+    assert result == "usage"
+    api.get_accounts.assert_not_awaited()
+
+
+async def test_get_data_without_account_resolves_default_account_once() -> None:
+    api = _make_api()
+    api._token = "tok"
+
+    with aioresponses() as mocked:
+        mocked.get(f"{BASE_URL}v1/account", status=500, body="")
+        mocked.get(
+            MYACCOUNT_ACCOUNTS_URL,
+            status=200,
+            payload=[{"accountNumber": 9001}, {"accountNumber": 9002}],
+        )
+        mocked.get(f"{BASE_URL}v1/usage/9001/halfhourly", status=200, body="a")
+        mocked.get(f"{BASE_URL}v1/usage/9001/halfhourly", status=200, body="b")
+
+        assert await api.get_data(endpoint="halfhourly") == "a"
+        # Second call: no further account requests (none registered).
+        assert await api.get_data(endpoint="halfhourly") == "b"
+
+    assert api.default_account_number == "9001"
+
+
+async def test_login_does_not_look_up_accounts() -> None:
+    """Accounts are chosen per subentry now; logging in alone mustn't need them."""
+    api = _make_api()
+    api._refresh_token = "refresh"
+    api.get_accounts = AsyncMock()
+
+    with aioresponses() as mocked:
+        mocked.post(
+            "https://wslpwb2cprd.b2clogin.com/tfp/wslpwb2cprd.onmicrosoft.com"
+            "/B2C_1_sign_up_or_sign_in_mobile/oauth2/v2.0/token",
+            status=200,
+            payload={"access_token": "new-token"},
+        )
+        assert await api.get_api_token() is True
+
+    api.get_accounts.assert_not_awaited()
+
+
+async def test_async_get_accounts_logs_in_and_lists_all_accounts() -> None:
+    api = _make_api()
+
+    async def _fake_login(*_args: Any, **_kwargs: Any) -> None:
+        api._token = "tok"
+
+    api.get_refresh_token = AsyncMock(side_effect=_fake_login)
+
+    with aioresponses() as mocked:
+        mocked.get(f"{BASE_URL}v1/account", status=500, body="")
+        mocked.get(
+            MYACCOUNT_ACCOUNTS_URL,
+            status=200,
+            payload=[
+                {"accountNumber": "1", "propertyAddress": "1 Example St"},
+                {"accountNumber": "2"},
+                {"accountName": "no number"},
+            ],
+        )
+        accounts = await api.async_get_accounts()
+
+    assert accounts == [
+        {"account_number": "1", "address": "1 Example St"},
+        {"account_number": "2", "address": None},
+    ]
+
+
+async def test_async_get_accounts_raises_when_login_yields_no_token() -> None:
+    api = _make_api()
+    api.get_refresh_token = AsyncMock()
+
+    with pytest.raises(ValueError, match="access token"):
+        await api.async_get_accounts()
