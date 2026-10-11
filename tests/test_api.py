@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
 BASE_URL = "https://customerapp.api.water.co.nz/"
+MYACCOUNT_ACCOUNTS_URL = "https://api.watercare.co.nz/account/Accounts"
 
 
 @pytest.fixture(autouse=True)
@@ -298,3 +299,53 @@ async def test_get_data_http_request_runs_with_lock_released(
 
     assert result == "ok"
     assert lock_states == [False]
+
+
+async def test_get_accounts_uses_v1_account_when_it_works() -> None:
+    api = _make_api()
+    api._token = "tok"
+
+    # Only /v1/account is registered: a MyAccount request would be an
+    # unmatched call and fail the test.
+    with aioresponses() as mocked:
+        mocked.get(
+            f"{BASE_URL}v1/account", status=200, payload=[{"accountNumber": "4242"}]
+        )
+        await api.get_accounts()
+
+    assert api._accountNumber == "4242"
+
+
+async def test_get_accounts_falls_back_to_myaccount_endpoint() -> None:
+    """Regression: /v1/account 500ing while the MyAccount endpoint still works."""
+    api = _make_api()
+    api._token = "tok"
+
+    with aioresponses() as mocked:
+        mocked.get(f"{BASE_URL}v1/account", status=500, body='{"code":"UNKNOWN_ERROR"}')
+        mocked.get(
+            MYACCOUNT_ACCOUNTS_URL,
+            status=200,
+            payload=[{"accountNumber": "5150", "propertyAddress": "1 Example St"}],
+        )
+        await api.get_accounts()
+
+    assert api._accountNumber == "5150"
+
+
+async def test_get_accounts_logs_each_failed_endpoint_when_both_fail(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    api = _make_api()
+    api._token = "tok"
+
+    with aioresponses() as mocked, caplog.at_level(logging.WARNING):
+        mocked.get(f"{BASE_URL}v1/account", status=500, body='{"code":"UNKNOWN_ERROR"}')
+        mocked.get(MYACCOUNT_ACCOUNTS_URL, status=503, body="")
+        await api.get_accounts()
+
+    assert api._accountNumber is None
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("status 500" in m for m in messages)
+    assert any("status 503" in m for m in messages)
+    assert any(r.levelno == logging.ERROR for r in caplog.records)
