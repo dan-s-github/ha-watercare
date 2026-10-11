@@ -217,26 +217,51 @@ class WatercareApi:
             return False
 
     async def get_accounts(self) -> None:
-        """Get the first account that we see."""
+        """
+        Get the first account that we see.
+
+        /v1/account has been seen returning 500 {"code":"UNKNOWN_ERROR"} --
+        for Watercare's own app too -- while the usage endpoints keep
+        working, so fall back to the MyAccount website's account endpoint,
+        which accepts the same mobile-app token and returns the same
+        accountNumber field.
+        """
+        for url in (
+            self._url_base + "v1/account",
+            "https://api.watercare.co.nz/account/Accounts",
+        ):
+            account_number = await self._get_account_number(url)
+            if account_number:
+                _LOGGER.debug("AccountNumber: %s", account_number)
+                self._accountNumber = account_number
+                return
+        _LOGGER.error("Failed to fetch customer accounts")
+
+    async def _get_account_number(self, url: str) -> str | None:
+        """Return the first account number from one account endpoint, or None."""
         headers = {"authorization": "Bearer " + (self._token or "")}
         session = async_get_clientsession(self._hass)
-        url = self._url_base + "v1/account"
         async with session.get(url, headers=headers) as result:
-            if result.status == _HTTP_OK:
-                data = await result.json()
-                _LOGGER.debug("Accounts: %s", data)
-                if data and isinstance(data, list) and len(data) > 0:
-                    self._accountNumber = data[0].get("accountNumber")
-                    if self._accountNumber:
-                        _LOGGER.debug("AccountNumber: %s", self._accountNumber)
-                    else:
-                        _LOGGER.error("Account number not found in the response")
-                else:
-                    _LOGGER.error("No accounts found in the response")
-            else:
-                _LOGGER.error(
-                    "Failed to fetch customer accounts %s", await result.text()
+            if result.status != _HTTP_OK:
+                _LOGGER.warning(
+                    "Account lookup at %s failed (status %s): %s",
+                    url,
+                    result.status,
+                    await result.text(),
                 )
+                return None
+            data = await result.json()
+
+        if not data or not isinstance(data, list):
+            _LOGGER.warning("No accounts found in the response from %s", url)
+            return None
+        # Count only: the MyAccount response also carries names, addresses
+        # and phone numbers, which have no business in debug logs.
+        _LOGGER.debug("Account lookup at %s returned %s account(s)", url, len(data))
+        account_number = data[0].get("accountNumber")
+        if not account_number:
+            _LOGGER.warning("Account number not found in the response from %s", url)
+        return account_number
 
     async def get_data(
         self, endpoint: str, start_date: str | None = None, end_date: str | None = None
