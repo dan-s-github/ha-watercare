@@ -58,38 +58,43 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 # Watercare publishes the previous day's final halfhourly readings around
-# 06:00-06:30 NZT (measured against the live API 2026-08-17 to 2026-08-20:
-# the 05:5x poll each day still saw the previous day's data, and by 06:29
-# the new day's 23:30 reading had landed -- one run caught it mid-publish
-# at 06:14 with an incomplete last half-hour), but the exact time isn't
-# fixed enough to just pick a single margin. Rather than HA's default
-# SCAN_INTERVAL, which polls every 12h from whatever moment the entity
-# happened to be added (so could easily land both daily polls before
-# Watercare has published), a standing quarter-hour tick (see
-# _schedule_polling) checks the NZ wall-clock time against these slots:
-# while the previous NZ day is incomplete (see _is_data_fresh), retry
-# every 15 min through POLL_START_HOUR_NZT's own hour (to catch the
-# publish close to when it actually lands), then hourly up to and
-# including POLL_RETRY_CUTOFF_HOUR_NZT -- self-correcting if the publish
-# time drifts, and no more API calls than needed once the data's in. If a
-# complete day still hasn't shown up by the cutoff, give up until the
-# next day's start hour rather than retrying indefinitely.
-POLL_START_HOUR_NZT = 6
+# 18:15-18:45 UTC, on a fixed UTC clock that ignores NZ daylight saving:
+# 06:15-06:45 NZST through 2026-09-26, then 07:15-07:45 NZDT once DST
+# started on 2026-09-27 (from the recorder's statistics write times, which
+# jumped from ~06:30 NZST to 08:00 NZDT -- the first retry slot after the
+# publish -- overnight). The same window was first measured against the
+# live API 2026-08-17 to 2026-08-20 (one run caught it mid-publish with an
+# incomplete last half-hour), but the exact time isn't fixed enough to just
+# pick a single margin. Rather than HA's default SCAN_INTERVAL, which polls
+# every 12h from whatever moment the entity happened to be added (so could
+# easily land both daily polls before Watercare has published), a standing
+# quarter-hour tick (see _schedule_polling) checks the UTC time against
+# these slots: while the previous NZ day is incomplete (see
+# _is_data_fresh), retry every 15 min through POLL_START_HOUR_UTC's own
+# hour (to catch the publish close to when it actually lands), then hourly
+# for POLL_RETRY_HOURS more hours -- self-correcting if the publish time
+# drifts, and no more API calls than needed once the data's in. If a
+# complete day still hasn't shown up by then, give up until the next day's
+# start hour rather than retrying indefinitely. The whole window
+# (18:00-00:00 UTC) falls within a single NZ calendar day in both NZST and
+# NZDT, so "the previous NZ day" means the same day throughout it.
+POLL_START_HOUR_UTC = 18
 QUARTER_HOUR_MINUTES = (0, 15, 30, 45)
-POLL_RETRY_CUTOFF_HOUR_NZT = 12
-# Retry slots from POLL_START_HOUR_NZT through POLL_RETRY_CUTOFF_HOUR_NZT,
-# inclusive: quarter-hourly during POLL_START_HOUR_NZT's own hour, then
-# hourly on the hour after that.
-POLL_RETRY_SLOTS_NZT = tuple(
-    (POLL_START_HOUR_NZT, minute) for minute in QUARTER_HOUR_MINUTES
+POLL_RETRY_HOURS = 6
+# (hour, minute) UTC retry slots: quarter-hourly during POLL_START_HOUR_UTC's
+# own hour, then hourly on the hour for POLL_RETRY_HOURS more hours
+# (wrapping past midnight UTC), the last one included.
+POLL_RETRY_SLOTS_UTC = tuple(
+    (POLL_START_HOUR_UTC, minute) for minute in QUARTER_HOUR_MINUTES
 ) + tuple(
-    (hour, 0) for hour in range(POLL_START_HOUR_NZT + 1, POLL_RETRY_CUTOFF_HOUR_NZT + 1)
+    ((POLL_START_HOUR_UTC + offset) % 24, 0)
+    for offset in range(1, POLL_RETRY_HOURS + 1)
 )
 # Endpoints other than halfhourly have no characterized publish time to
 # retry against, so they poll on a fixed twice-daily schedule instead --
 # preserving the ~12h cadence of the SCAN_INTERVAL polling that this
 # fixed-time scheduling replaced.
-SECONDARY_POLL_HOUR_NZT = 18
+SECONDARY_POLL_HOUR_UTC = (POLL_START_HOUR_UTC + 12) % 24
 
 # The halfhourly endpoint silently caps each request at ~161 days regardless
 # of the requested range (it always starts exactly at the requested `from`
@@ -254,17 +259,17 @@ class WatercareUsageSensor(SensorEntity):
         # _should_poll_now's hourly recovery retries.
         self._last_update_failed = False
         # halfhourly polls once at the start hour (plus the stale-retry
-        # ladder, see POLL_RETRY_SLOTS_NZT); other endpoints poll twice
-        # daily (see SECONDARY_POLL_HOUR_NZT).
+        # ladder, see POLL_RETRY_SLOTS_UTC); other endpoints poll twice
+        # daily (see SECONDARY_POLL_HOUR_UTC). (hour, minute) in UTC.
         self._daily_poll_slots = (
-            ((POLL_START_HOUR_NZT, 0),)
+            ((POLL_START_HOUR_UTC, 0),)
             if endpoint == "halfhourly"
-            else ((POLL_START_HOUR_NZT, 0), (SECONDARY_POLL_HOUR_NZT, 0))
+            else ((POLL_START_HOUR_UTC, 0), (SECONDARY_POLL_HOUR_UTC, 0))
         )
         # Latest complete NZ day confirmed in halfhourly readings -- drives
         # _is_data_fresh's retry decision. Left unset by endpoints other
         # than halfhourly, which don't publish on a characterized schedule
-        # (see POLL_START_HOUR_NZT).
+        # (see POLL_START_HOUR_UTC).
         self._latest_reading_date: date_type | None = None
 
     @property
@@ -318,7 +323,7 @@ class WatercareUsageSensor(SensorEntity):
 
         Only halfhourly tracks this (see _bucket_hourly_readings) -- it's
         the only endpoint whose publish timing has been characterized (see
-        POLL_START_HOUR_NZT); other endpoints poll on their fixed daily
+        POLL_START_HOUR_UTC); other endpoints poll on their fixed daily
         slots instead of retrying for a signal they don't have. For
         halfhourly, never having seen a complete day (fresh install, or
         the in-memory date lost to a restart before a successful update)
@@ -331,9 +336,9 @@ class WatercareUsageSensor(SensorEntity):
             return False
         return self._latest_reading_date >= now_nz.date() - timedelta(days=1)
 
-    def _should_poll_now(self, now_nz: datetime) -> bool:
+    def _should_poll_now(self, now: datetime) -> bool:
         """
-        Whether this quarter-hour tick should hit the API.
+        Whether this quarter-hour tick (timezone-aware `now`) should hit the API.
 
         Three reasons to poll: the endpoint's fixed daily slot(s); the
         stale-retry ladder while the previous NZ day is incomplete; and
@@ -342,11 +347,18 @@ class WatercareUsageSensor(SensorEntity):
         leave the sensor stale until the next fixed slot -- the
         SCAN_INTERVAL polling this replaced recovered within 12h, and
         hourly is the same idea with a tighter bound.
+
+        Slots are matched in UTC, the clock Watercare publishes on (see
+        POLL_START_HOUR_UTC); freshness is judged by NZ calendar day.
         """
-        slot = (now_nz.hour, now_nz.minute)
-        if self._last_update_failed and now_nz.minute == 0:
+        now_utc = now.astimezone(UTC)
+        slot = (now_utc.hour, now_utc.minute)
+        if self._last_update_failed and now_utc.minute == 0:
             return True
-        if not self._is_data_fresh(now_nz) and slot in POLL_RETRY_SLOTS_NZT:
+        if (
+            not self._is_data_fresh(now.astimezone(NZ_TIMEZONE))
+            and slot in POLL_RETRY_SLOTS_UTC
+        ):
             return True
         return slot in self._daily_poll_slots
 
@@ -360,10 +372,9 @@ class WatercareUsageSensor(SensorEntity):
         timer to leak or orphan if scheduling or teardown ever races an
         in-flight update. The tick fires at minutes 00/15/30/45 in HA's
         configured timezone -- every real-world UTC offset is a multiple
-        of 15 minutes, so that grid coincides with the same NZ wall-clock
-        minutes no matter where HA runs; the callback converts to NZT and
-        decides whether this tick is one of the NZ poll slots (see
-        _should_poll_now).
+        of 15 minutes, so that grid coincides with the same UTC minutes no
+        matter where HA runs; the callback decides whether this tick is
+        one of the UTC poll slots (see _should_poll_now).
         """
         if self._unsub_scheduled_poll is not None:
             return
@@ -381,7 +392,7 @@ class WatercareUsageSensor(SensorEntity):
         # state on a defunct entity.
         if self._unsub_scheduled_poll is None:
             return
-        if not self._should_poll_now(now.astimezone(NZ_TIMEZONE)):
+        if not self._should_poll_now(now):
             return
         # Nothing awaits this callback, so failures must be caught and
         # logged here rather than left to escape silently.
