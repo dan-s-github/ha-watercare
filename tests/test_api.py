@@ -463,3 +463,100 @@ async def test_async_get_accounts_raises_when_login_yields_no_token() -> None:
 
     with pytest.raises(ValueError, match="access token"):
         await api.async_get_accounts()
+
+
+async def test_get_data_renews_token_rejected_by_default_account_lookup() -> None:
+    """
+    Regression: an expired token must not wedge the default-account lookup.
+
+    get_data() only renews a token when a usage request 401s, and it never
+    reaches the usage request while the default account is unresolved --
+    so the lookup has to renew a rejected token itself, or every poll fails
+    until HA restarts.
+    """
+    api = _make_api()
+    api._token = "stale-token"
+    api._refresh_token = "some-refresh-token"
+
+    async def _fake_get_api_token(*_args: Any, **_kwargs: Any) -> bool:
+        api._token = "fresh-token"
+        return True
+
+    api.get_api_token = AsyncMock(side_effect=_fake_get_api_token)
+
+    with aioresponses() as mocked:
+        mocked.get(f"{BASE_URL}v1/account", status=401, body="")
+        mocked.get(
+            f"{BASE_URL}v1/account", status=200, payload=[{"accountNumber": 5150}]
+        )
+        mocked.get(f"{BASE_URL}v1/usage/5150/halfhourly", status=200, body="usage")
+
+        result = await api.get_data(endpoint="halfhourly")
+
+    api.get_api_token.assert_awaited_once()
+    assert result == "usage"
+    assert api.default_account_number == "5150"
+
+
+async def test_account_lookup_skips_fallback_endpoint_on_401() -> None:
+    """A rejected token is renewed rather than retried at the other endpoint."""
+    api = _make_api()
+    api._token = "stale-token"
+    api._refresh_token = "some-refresh-token"
+
+    async def _fake_get_api_token(*_args: Any, **_kwargs: Any) -> bool:
+        api._token = "fresh-token"
+        return True
+
+    api.get_api_token = AsyncMock(side_effect=_fake_get_api_token)
+
+    with aioresponses() as mocked:
+        mocked.get(f"{BASE_URL}v1/account", status=401, body="")
+        mocked.get(
+            f"{BASE_URL}v1/account", status=200, payload=[{"accountNumber": 5150}]
+        )
+        # No MyAccount response registered: hitting it would raise.
+        await api.get_accounts()
+
+    assert api.default_account_number == "5150"
+
+
+async def test_account_lookup_gives_up_when_renewed_token_is_rejected_too(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    api = _make_api()
+    api._token = "stale-token"
+    api._refresh_token = "some-refresh-token"
+
+    async def _fake_get_api_token(*_args: Any, **_kwargs: Any) -> bool:
+        api._token = "fresh-token"
+        return True
+
+    api.get_api_token = AsyncMock(side_effect=_fake_get_api_token)
+
+    with aioresponses() as mocked, caplog.at_level(logging.WARNING):
+        mocked.get(f"{BASE_URL}v1/account", status=401, body="")
+        mocked.get(f"{BASE_URL}v1/account", status=401, body="")
+
+        result = await api.get_data(endpoint="halfhourly")
+
+    api.get_api_token.assert_awaited_once()
+    assert result is None
+    assert api.default_account_number is None
+    assert any("freshly renewed" in message for message in caplog.messages)
+
+
+async def test_account_lookup_gives_up_when_token_renewal_fails() -> None:
+    api = _make_api()
+    api._token = "stale-token"
+    api._refresh_token = None
+    api.get_refresh_token = AsyncMock()  # full login leaves _token unchanged
+
+    with aioresponses() as mocked:
+        mocked.get(f"{BASE_URL}v1/account", status=401, body="")
+
+        result = await api.get_data(endpoint="halfhourly")
+
+    api.get_refresh_token.assert_awaited_once()
+    assert result is None
+    assert api.default_account_number is None

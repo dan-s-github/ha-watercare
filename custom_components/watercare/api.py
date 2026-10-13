@@ -30,6 +30,10 @@ class WatercareAuthError(Exception):
     """Raised when Watercare conclusively rejects the account credentials."""
 
 
+class _AccessTokenRejectedError(Exception):
+    """Raised when an account endpoint rejects the cached access token (401)."""
+
+
 class WatercareApi:
     """Define the Watercare API."""
 
@@ -248,6 +252,29 @@ class WatercareApi:
 
     async def _fetch_accounts(self) -> list[dict[str, str | None]]:
         """
+        Return the login's accounts, renewing a rejected access token once.
+
+        Must be called with self._lock held. The usage requests in
+        get_data() are the only other place a stale token gets renewed, and
+        get_data() never reaches them while the default account is still
+        unresolved -- so without renewing here, an access token that
+        expired before the lookup first succeeded would be reused (and
+        rejected) on every poll until HA restarted.
+        """
+        try:
+            return await self._fetch_accounts_from_any()
+        except _AccessTokenRejectedError:
+            _LOGGER.debug("Account lookup rejected the access token; re-authenticating")
+            if not await self._async_renew_token():
+                return []
+        try:
+            return await self._fetch_accounts_from_any()
+        except _AccessTokenRejectedError:
+            _LOGGER.warning("Account lookup rejected a freshly renewed access token")
+            return []
+
+    async def _fetch_accounts_from_any(self) -> list[dict[str, str | None]]:
+        """
         Return the login's accounts, trying each account endpoint in turn.
 
         /v1/account has been seen returning 500 {"code":"UNKNOWN_ERROR"} --
@@ -277,6 +304,11 @@ class WatercareApi:
         headers = {"authorization": "Bearer " + (self._token or "")}
         session = async_get_clientsession(self._hass)
         async with session.get(url, headers=headers) as result:
+            if result.status == _HTTP_UNAUTHORIZED:
+                # The token, not this endpoint, is the problem: the other
+                # endpoint would reject it too, so let _fetch_accounts()
+                # renew it rather than trying the next one.
+                raise _AccessTokenRejectedError
             if result.status != _HTTP_OK:
                 _LOGGER.warning(
                     "Account lookup at %s failed (status %s): %s",
@@ -342,18 +374,7 @@ class WatercareApi:
             # later poll would 401. Re-authenticate once and retry.
             _LOGGER.debug("Access token rejected (401); re-authenticating and retrying")
             async with self._lock:
-                stale_token = self._token
-                # The refresh-token grant can itself fail (e.g. the refresh
-                # token has expired) without raising -- it just leaves
-                # _token as it was, which would otherwise look like a no-op
-                # success and retry with the same stale token. Fall back to
-                # a full login whenever it doesn't actually get us a fresh
-                # token.
-                refreshed = bool(self._refresh_token) and await self.get_api_token()
-                if not refreshed:
-                    await self.get_refresh_token()
-                if not self._token or self._token == stale_token:
-                    _LOGGER.error("Re-authentication failed - no new access token")
+                if not await self._async_renew_token():
                     return None
 
             status, data, error_text = await self._request_usage(
@@ -365,6 +386,25 @@ class WatercareApi:
             _LOGGER.debug("Error response body: %s", error_text)
             return None
         return data
+
+    async def _async_renew_token(self) -> bool:
+        """
+        Replace a rejected access token; return whether a new one was obtained.
+
+        Must be called with self._lock held. The refresh-token grant can
+        itself fail (e.g. the refresh token has expired) without raising --
+        it just leaves _token as it was, which would otherwise look like a
+        no-op success and retry with the same stale token. Fall back to a
+        full login whenever it doesn't actually get us a fresh token.
+        """
+        stale_token = self._token
+        refreshed = bool(self._refresh_token) and await self.get_api_token()
+        if not refreshed:
+            await self.get_refresh_token()
+        if not self._token or self._token == stale_token:
+            _LOGGER.error("Re-authentication failed - no new access token")
+            return False
+        return True
 
     async def _ensure_authenticated(self, *, need_default_account: bool) -> bool:
         """Log in if there's no access token, and resolve the default account."""
