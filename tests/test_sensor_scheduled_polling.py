@@ -1,11 +1,11 @@
-"""Tests for the fixed NZ-time poll scheduling (should_poll=False path)."""
+"""Tests for the fixed UTC-time poll scheduling (should_poll=False path)."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime, timedelta
 from datetime import date as date_type
-from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
@@ -24,6 +24,11 @@ if TYPE_CHECKING:
 def nz_dt(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
     """Build an NZ-time datetime."""
     return datetime(year, month, day, hour, minute, 0, tzinfo=NZ_TIMEZONE)
+
+
+def utc_dt(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
+    """Build a UTC datetime (poll slots are matched in UTC)."""
+    return datetime(year, month, day, hour, minute, 0, tzinfo=UTC)
 
 
 def test_should_poll_is_disabled(
@@ -81,11 +86,11 @@ def test_non_halfhourly_endpoints_are_always_fresh(
 @pytest.mark.parametrize(
     ("hour", "minute", "expected"),
     [
-        (6, 0, True),  # the daily slot
-        (6, 15, False),  # quarter slots are stale-retry only
-        (12, 0, False),
-        (18, 0, False),  # halfhourly has no secondary daily slot
+        (18, 0, True),  # the daily slot
+        (18, 15, False),  # quarter slots are stale-retry only
         (0, 0, False),
+        (6, 0, False),  # halfhourly has no secondary daily slot
+        (12, 0, False),
     ],
 )
 def test_should_poll_now_fresh_halfhourly_polls_only_at_start_hour(
@@ -95,24 +100,24 @@ def test_should_poll_now_fresh_halfhourly_polls_only_at_start_hour(
     expected: bool,  # noqa: FBT001 -- pytest parametrization
 ) -> None:
     sensor = make_sensor(endpoint="halfhourly")
-    now_nz = nz_dt(2026, 8, 16, hour, minute)
-    sensor._latest_reading_date = now_nz.date() - timedelta(days=1)
+    now = utc_dt(2026, 8, 16, hour, minute)
+    sensor._latest_reading_date = now.astimezone(NZ_TIMEZONE).date() - timedelta(days=1)
 
-    assert sensor._should_poll_now(now_nz) is expected
+    assert sensor._should_poll_now(now) is expected
 
 
 @pytest.mark.parametrize(
     ("hour", "minute", "expected"),
     [
-        (6, 0, True),
-        (6, 15, True),  # quarter-hourly through the start hour
-        (6, 45, True),
-        (7, 0, True),  # then hourly
-        (7, 15, False),
-        (12, 0, True),  # the cutoff hour itself is still polled
-        (12, 15, False),
-        (13, 0, False),  # past the cutoff: give up for the day
-        (3, 0, False),  # before the window
+        (18, 0, True),
+        (18, 15, True),  # quarter-hourly through the start hour
+        (18, 45, True),
+        (19, 0, True),  # then hourly
+        (19, 15, False),
+        (0, 0, True),  # the last retry hour (past midnight UTC) is still polled
+        (0, 15, False),
+        (1, 0, False),  # past the last retry: give up for the day
+        (15, 0, False),  # before the window
     ],
 )
 def test_should_poll_now_stale_halfhourly_follows_retry_ladder(
@@ -124,7 +129,7 @@ def test_should_poll_now_stale_halfhourly_follows_retry_ladder(
     sensor = make_sensor(endpoint="halfhourly")
     sensor._latest_reading_date = date_type(2026, 8, 14)  # stale
 
-    assert sensor._should_poll_now(nz_dt(2026, 8, 16, hour, minute)) is expected
+    assert sensor._should_poll_now(utc_dt(2026, 8, 16, hour, minute)) is expected
 
 
 @pytest.mark.parametrize(
@@ -148,20 +153,22 @@ def test_should_poll_now_retries_hourly_after_failed_update(
     failed poll within 12h; the failed-update flag drives hourly retries.
     """
     sensor = make_sensor(endpoint="halfhourly")
-    now_nz = nz_dt(2026, 8, 16, hour, minute)
-    sensor._latest_reading_date = now_nz.date() - timedelta(days=1)  # data fresh
+    now = utc_dt(2026, 8, 16, hour, minute)
+    sensor._latest_reading_date = now.astimezone(NZ_TIMEZONE).date() - timedelta(
+        days=1
+    )  # data fresh
     sensor._last_update_failed = True
 
-    assert sensor._should_poll_now(now_nz) is expected
+    assert sensor._should_poll_now(now) is expected
 
 
 @pytest.mark.parametrize(
     ("hour", "minute", "expected"),
     [
-        (6, 0, True),
-        (18, 0, True),  # secondary slot preserves the old ~12h cadence
-        (7, 0, False),
-        (12, 0, False),
+        (18, 0, True),
+        (6, 0, True),  # secondary slot preserves the old ~12h cadence
+        (19, 0, False),
+        (0, 0, False),
     ],
 )
 def test_should_poll_now_other_endpoints_poll_twice_daily(
@@ -172,7 +179,36 @@ def test_should_poll_now_other_endpoints_poll_twice_daily(
 ) -> None:
     sensor = make_sensor(endpoint="dailywithstats")
 
-    assert sensor._should_poll_now(nz_dt(2026, 8, 16, hour, minute)) is expected
+    assert sensor._should_poll_now(utc_dt(2026, 8, 16, hour, minute)) is expected
+
+
+@pytest.mark.parametrize(
+    ("now_nz", "expected"),
+    [
+        (nz_dt(2026, 8, 16, 6), True),  # NZST (UTC+12): 18:00 UTC
+        (nz_dt(2026, 8, 16, 7), False),
+        (nz_dt(2026, 10, 13, 7), True),  # NZDT (UTC+13): 18:00 UTC
+        (nz_dt(2026, 10, 13, 6), False),
+    ],
+    ids=["nzst-0600", "nzst-0700", "nzdt-0700", "nzdt-0600"],
+)
+def test_should_poll_now_daily_slot_tracks_utc_across_dst(
+    make_sensor: Callable[..., WatercareUsageSensor],
+    now_nz: datetime,
+    expected: bool,  # noqa: FBT001 -- pytest parametrization
+) -> None:
+    """
+    Regression: the daily slot must follow Watercare's UTC publish clock.
+
+    Watercare publishes at ~18:15-18:45 UTC year-round. With the slots
+    pinned to NZ wall-clock time, NZDT pushed the publish to 07:15-07:45
+    local, past the whole 06:xx quarter-hourly window, so every day's data
+    waited for the 08:00 hourly retry.
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+    sensor._latest_reading_date = now_nz.date() - timedelta(days=1)
+
+    assert sensor._should_poll_now(now_nz) is expected
 
 
 def test_schedule_polling_registers_quarter_hour_tick(
