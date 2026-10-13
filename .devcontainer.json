@@ -1,10 +1,7 @@
 {
     "name": "brunsy/ha-watercare",
     "image": "mcr.microsoft.com/devcontainers/base:debian",
-    "postCreateCommand": "scripts/setup",
-    "mounts": [
-        "source=${localWorkspaceFolder}/../bare.git,target=${localWorkspaceFolder}/../bare.git,type=bind"
-    ],
+    "postCreateCommand": "git config --global --add safe.directory ${containerWorkspaceFolder} && scripts/setup",
     "forwardPorts": [
         8123
     ],
