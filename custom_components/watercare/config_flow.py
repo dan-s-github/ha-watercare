@@ -92,7 +92,12 @@ async def _async_sign_in(
     signing in worked but Watercare's account lookup didn't -- the account
     form then falls back to typing the number in.
     """
-    api = WatercareApi(hass, credentials[CONF_USERNAME], credentials[CONF_PASSWORD])
+    # Sign in with the same stripped username the forms save, so stray
+    # whitespace (e.g. from autofill) can't fail a sign-in that the saved
+    # credentials would pass.
+    api = WatercareApi(
+        hass, credentials[CONF_USERNAME].strip(), credentials[CONF_PASSWORD]
+    )
     try:
         return {}, await api.async_get_accounts()
     except WatercareAuthError:

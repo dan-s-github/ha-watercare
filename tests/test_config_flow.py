@@ -63,6 +63,21 @@ def _suggested(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def test_sign_in_uses_stripped_username(mock_api: MagicMock) -> None:
+    """
+    Regression: sign in with the username the form saves, not the raw input.
+
+    Every form strips the username before saving it and using it as the
+    unique id; signing in with the unstripped value would reject autofilled
+    whitespace as invalid_auth even though the saved credentials work.
+    """
+    flow = _make_flow()
+
+    await flow.async_step_user(dict(CREDENTIALS))
+
+    mock_api.assert_called_once_with(flow.hass, "User@Example.com", "hunter2")
+
+
 @pytest.mark.usefixtures("mock_api")
 async def test_user_step_signs_in_then_asks_for_first_account() -> None:
     flow = _make_flow()

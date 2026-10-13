@@ -1617,9 +1617,8 @@ class WatercareUsageSensor(SensorEntity):
         # polling has already run and advanced that watermark, none of this
         # deep-history data -- which is by definition older -- can actually
         # be written, even though the API calls above succeeded.
-        _, last_start = await self._async_last_statistic_sum(
-            f"{DOMAIN}:halfhourly_consumption"
-        )
+        consumption_statistic_id = self._statistic_id("halfhourly_consumption")
+        _, last_start = await self._async_last_statistic_sum(consumption_statistic_id)
         oldest_collected = min(hourly_consumption)
         if last_start is not None and oldest_collected.timestamp() <= last_start:
             _LOGGER.warning(
@@ -1627,11 +1626,12 @@ class WatercareUsageSensor(SensorEntity):
                 "halfhourly statistics already start at or before that point "
                 "(from regular polling) -- history is only ever appended after "
                 "the latest stored hour, so this older data won't be written. "
-                "To re-import deeper history, clear the watercare:halfhourly_* "
-                "statistics first (Developer tools > Statistics) and re-run "
-                "this service",
+                "To re-import deeper history, clear this account's halfhourly "
+                "statistics (%s and its cost series) first (Developer tools > "
+                "Statistics) and re-run this service",
                 len(hourly_consumption),
                 oldest_collected,
+                consumption_statistic_id,
             )
 
         new_count = await self._async_push_halfhourly_statistics(hourly_consumption)
