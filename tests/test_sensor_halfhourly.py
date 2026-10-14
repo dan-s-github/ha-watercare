@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
@@ -11,7 +11,12 @@ import pytest
 
 from custom_components.watercare import sensor as watercare_sensor
 from custom_components.watercare.const import NZ_TIMEZONE
-from tests.conftest import load_fixture, nz_timestamp, nz_timestamp_on
+from tests.conftest import (
+    load_fixture,
+    nz_full_day_readings,
+    nz_timestamp,
+    nz_timestamp_on,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -51,7 +56,7 @@ def test_bucket_hourly_readings_sums_half_hours_into_hours(
     assert len(buckets) == 3
     sums_in_order = [buckets[hour] for hour in sorted(buckets)]
     assert sums_in_order == [35, 40, 5]  # (20+15), (30+10), (5)
-    assert latest_complete_date is None  # fixture has no 23:30 NZT reading
+    assert latest_complete_date is None  # fixture covers only 12:00-14:00 NZT
 
 
 def test_bucket_hourly_readings_finds_latest_complete_date_in_same_pass(
@@ -60,15 +65,67 @@ def test_bucket_hourly_readings_finds_latest_complete_date_in_same_pass(
     sensor = make_sensor(endpoint="halfhourly")
     nz_now = datetime.now(NZ_TIMEZONE)
     yesterday = (nz_now - timedelta(days=1)).date()
-    readings = [
-        {"timestamp": nz_timestamp_on(yesterday, 23, 0), "litres": 5},
-        {"timestamp": nz_timestamp_on(yesterday, 23, 30), "litres": 5},
-    ]
+    readings = nz_full_day_readings(yesterday, {(23, 0): 5, (23, 30): 5})
 
     buckets, latest_complete_date = sensor._bucket_hourly_readings(readings)
 
-    assert len(buckets) == 1  # both fall in the same hourly bucket
+    assert buckets[max(buckets)] == 10  # 23:00 and 23:30 share an hourly bucket
     assert latest_complete_date == yesterday
+
+
+def test_bucket_hourly_readings_sparse_day_with_last_slot_not_complete(
+    make_sensor: Callable[..., WatercareUsageSensor],
+) -> None:
+    """
+    Regression: a sparse mid-publish response must not mark its day complete.
+
+    Seen live at 07:15 NZDT (18:15 UTC) on 2026-10-14: the response had
+    only a handful of the previous day's slots, 23:30 among them. Under the
+    old "23:30 seen" rule the day counted as complete, _is_data_fresh
+    stopped the retry ladder, and the day's statistics stayed mostly empty.
+    """
+    sensor = make_sensor(endpoint="halfhourly")
+    nz_now = datetime.now(NZ_TIMEZONE)
+    yesterday = (nz_now - timedelta(days=1)).date()
+    readings = [
+        r
+        for r in nz_full_day_readings(yesterday)
+        if r["timestamp"]
+        in {
+            nz_timestamp_on(yesterday, 0, 0),
+            nz_timestamp_on(yesterday, 4, 0),
+            nz_timestamp_on(yesterday, 21, 0),
+            nz_timestamp_on(yesterday, 23, 0),
+            nz_timestamp_on(yesterday, 23, 30),
+        }
+    ]
+
+    _, latest_complete_date = sensor._bucket_hourly_readings(readings)
+
+    assert latest_complete_date is None
+
+
+@pytest.mark.parametrize(
+    ("dst_day", "slots"),
+    [(date(2026, 9, 27), 46), (date(2026, 4, 5), 50)],
+    ids=["dst-start", "dst-end"],
+)
+def test_bucket_hourly_readings_dst_day_complete_with_all_its_slots(
+    make_sensor: Callable[..., WatercareUsageSensor], dst_day: date, slots: int
+) -> None:
+    """A DST day is complete with its own 46/50 slots, and not one short."""
+    sensor = make_sensor(endpoint="halfhourly")
+    readings = nz_full_day_readings(dst_day)
+    assert len(readings) == slots
+
+    _, latest_complete_date = sensor._bucket_hourly_readings(readings)
+    assert latest_complete_date == dst_day
+
+    # Drop one slot from the middle of the day -- on the DST-end day, one
+    # of the two 02:30s, which only differ by UTC instant.
+    readings.pop(5)
+    _, latest_complete_date = sensor._bucket_hourly_readings(readings)
+    assert latest_complete_date is None
 
 
 async def test_push_hourly_statistic_no_existing_watermark_writes_all(
@@ -584,13 +641,13 @@ async def test_process_halfhourly_data_partial_last_day_not_marked_complete(
     assert not patch_recorder.written
 
 
-async def test_process_halfhourly_data_marks_day_complete_once_last_slot_seen(
+async def test_process_halfhourly_data_marks_day_complete_once_every_slot_seen(
     make_sensor: Callable[..., WatercareUsageSensor],
 ) -> None:
     sensor = make_sensor(endpoint="halfhourly")
     nz_now = datetime.now(NZ_TIMEZONE)
     yesterday = (nz_now - timedelta(days=1)).date()
-    payload = [{"timestamp": nz_timestamp_on(yesterday, 23, 30), "litres": 20}]
+    payload = nz_full_day_readings(yesterday, {(23, 30): 20})
 
     await sensor.process_halfhourly_data(json.dumps(payload))
 
@@ -606,7 +663,7 @@ async def test_process_halfhourly_data_does_not_regress_known_complete_date(
     already_known = (nz_now - timedelta(days=1)).date()
     sensor._latest_reading_date = already_known
     older_complete = (nz_now - timedelta(days=3)).date()
-    payload = [{"timestamp": nz_timestamp_on(older_complete, 23, 30), "litres": 20}]
+    payload = nz_full_day_readings(older_complete, {(23, 30): 20})
 
     await sensor.process_halfhourly_data(json.dumps(payload))
 
@@ -631,15 +688,16 @@ async def test_process_halfhourly_data_excludes_partial_trailing_day_from_push(
     complete_day = (nz_now - timedelta(days=2)).date()
     partial_day = (nz_now - timedelta(days=1)).date()
     payload = [
-        {"timestamp": nz_timestamp_on(complete_day, 23, 30), "litres": 10},
+        *nz_full_day_readings(complete_day, {(23, 30): 10}),
         {"timestamp": nz_timestamp_on(partial_day, 23, 0), "litres": 20},
     ]
 
     await sensor.process_halfhourly_data(json.dumps(payload))
 
     points = patch_recorder.written["watercare:halfhourly_consumption"]
-    assert len(points) == 1  # only the complete day's bucket
-    assert points[0]["sum"] == 10
+    # Only the complete day's buckets.
+    assert all(p["start"].date() == complete_day for p in points)
+    assert points[-1]["sum"] == 10
     assert sensor._latest_reading_date == complete_day
 
 
@@ -659,7 +717,7 @@ async def test_process_halfhourly_data_failed_push_leaves_day_stale(
     )
     nz_now = datetime.now(NZ_TIMEZONE)
     yesterday = (nz_now - timedelta(days=1)).date()
-    payload = [{"timestamp": nz_timestamp_on(yesterday, 23, 30), "litres": 20}]
+    payload = nz_full_day_readings(yesterday, {(23, 30): 20})
 
     with pytest.raises(RuntimeError):
         await sensor.process_halfhourly_data(json.dumps(payload))

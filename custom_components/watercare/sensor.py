@@ -1043,15 +1043,23 @@ class WatercareUsageSensor(SensorEntity):
         fully published, computed in the same pass over `readings` rather
         than re-parsing timestamps separately (this can run on years of
         backfilled readings, not just a single poll's response). A day
-        only counts as complete once its final half-hour slot (23:30 NZT)
-        has been published -- an earlier partial reading for "today" (e.g.
-        23:00 with no 23:30 yet, as seen live: Watercare briefly published
-        a 23:00-only reading before 23:30 landed 15 min later) must not be
-        mistaken for a complete day, or _is_data_fresh would stop retrying
-        before the last half-hour actually arrives.
+        only counts as complete once every one of its half-hour slots has
+        been published -- Watercare returns zero-litre slots rather than
+        omitting them (the recorder shows hundreds of zero-use hours), so
+        a missing slot means the publish isn't finished. Seen live
+        mid-publish: a 23:00-only reading for the day (23:30 landed 15 min
+        later), and, once polls moved to UTC and started landing inside
+        the publish window, a response with only a handful of the day's
+        slots that still included 23:30. Either would otherwise be
+        mistaken for a complete day, and _is_data_fresh would stop
+        retrying with most of the day unwritten.
         """
         hourly_consumption: dict[datetime, float] = {}
-        complete_dates: set[date_type] = set()
+        # Slots seen per NZ date, keyed by UTC instant: on the DST-end day
+        # the two 02:30 NZDT/NZST readings compare equal as NZ-local
+        # datetimes (fold is ignored within one zone), and would collapse
+        # into one slot.
+        slots_by_date: dict[date_type, set[float]] = {}
         for reading in readings:
             reading_time = self._parse_reading_time(reading.get("timestamp"))
             if reading_time is None:
@@ -1061,9 +1069,23 @@ class WatercareUsageSensor(SensorEntity):
             hourly_consumption[hour_start] = (
                 hourly_consumption.get(hour_start, 0) + litres
             )
-            if (reading_time.hour, reading_time.minute) == (23, 30):
-                complete_dates.add(reading_time.date())
+            slots_by_date.setdefault(reading_time.date(), set()).add(
+                reading_time.timestamp()
+            )
+        complete_dates = (
+            day
+            for day, slots in slots_by_date.items()
+            if len(slots) >= self._half_hour_slots_in_nz_day(day)
+        )
         return hourly_consumption, max(complete_dates, default=None)
+
+    @staticmethod
+    def _half_hour_slots_in_nz_day(day: date_type) -> int:
+        """Half-hour slots in an NZ calendar day: 48, or 46/50 across DST."""
+        start = datetime(day.year, day.month, day.day, tzinfo=NZ_TIMEZONE)
+        next_day = day + timedelta(days=1)
+        end = datetime(next_day.year, next_day.month, next_day.day, tzinfo=NZ_TIMEZONE)
+        return int((end.timestamp() - start.timestamp()) // 1800)
 
     def _advance_latest_reading_date(
         self, latest_complete_date: date_type | None
@@ -1161,12 +1183,13 @@ class WatercareUsageSensor(SensorEntity):
         hours this poll didn't return. Fixes a gap class the plain
         append-only push (see
         _async_push_hourly_statistic) can't: Watercare's API has been
-        observed to return a sparse set of half-hourly readings for a day
-        that still includes the 23:30 reading, so _bucket_hourly_readings
-        correctly calls the day complete, but the resulting push is missing
-        whichever hours weren't in that response -- and since the watermark
-        only advances, a later poll with a fuller response for the same day
-        could never fill them in. Recomputing the whole window from an
+        observed to return a sparse set of half-hourly readings for an
+        earlier day in the window than the one _bucket_hourly_readings
+        confirms complete (only the latest complete date is checked slot by
+        slot), so the resulting push is missing whichever hours weren't in
+        that response -- and since the watermark only advances, a later
+        poll with a fuller response for the same day could never fill them
+        in. Recomputing the whole window from an
         anchor before it and upserting (async_add_external_statistics
         updates an existing point for a given start rather than duplicating
         it) means a hole from one poll's sparse response gets healed the
@@ -1486,12 +1509,12 @@ class WatercareUsageSensor(SensorEntity):
 
         # Only push statistics for confirmed-complete days. A poll that
         # catches Watercare mid-publish (observed live: the 06:14 poll saw
-        # yesterday up to 23:00 with no 23:30 yet) would otherwise write a
-        # partial trailing-hour bucket and advance the append-only
-        # watermark past it, permanently excluding the late-arriving
-        # half-hour's litres from the cumulative sums. Deferred days are
-        # re-fetched by the retry ladder (and the 7-day request window)
-        # once complete.
+        # yesterday up to 23:00 with no 23:30 yet; the 07:15 NZDT poll saw
+        # only a handful of yesterday's slots) would otherwise write partial
+        # buckets and advance the append-only watermark past them,
+        # permanently excluding the late-arriving litres from the
+        # cumulative sums. Deferred days are re-fetched by the retry ladder
+        # (and the 7-day request window) once complete.
         if latest_complete_date is None:
             _LOGGER.warning(
                 "Halfhourly response contained no confirmed-complete day; "
@@ -1505,9 +1528,9 @@ class WatercareUsageSensor(SensorEntity):
         }
         # Heal the whole fetched window, not just append past the
         # watermark: Watercare's API has been observed to return a sparse
-        # set of readings for a day that still includes the 23:30 reading,
-        # so a later, fuller response for the same day needs to be able to
-        # fill in what an earlier poll's push missed (see
+        # set of readings, and only the latest complete day is checked slot
+        # by slot, so a later, fuller response for an earlier day needs to
+        # be able to fill in what an earlier poll's push missed (see
         # _async_heal_hourly_points).
         await self._async_push_halfhourly_statistics(
             complete_day_buckets, heal_since=min(complete_day_buckets)
